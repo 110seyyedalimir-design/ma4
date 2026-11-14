@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-حافظه‌ی پشتیبان تلگرامی — داده‌های حیاتی (منطقه‌ها + کاربران) در یک پیام
-خودکار در چت مدیر ذخیره و ویرایش می‌شود؛ حتی اگر اسپیس از نو ساخته شود،
-داده‌ها از تلگرام برمی‌گردند. (پشتیبانِ persist.py)
+حافظه‌ی پشتیبان تلگرامی — داده‌های حیاتی (منطقه‌ها + کاربران) به‌صورت خودکار
+در گروه/چت مدیر ذخیره می‌شود؛ حتی اگر محیط اجرا از نو ساخته شود، داده‌ها از
+تلگرام برمی‌گردند. (پشتیبانِ persist.py)
+
+حالت‌ها (با متغیر محیطی):
+  TGSTORE_MODE=new  (پیش‌فرض) → هر بار **پیام تازه** می‌فرستد؛ ویرایش نمی‌کند
+  TGSTORE_MODE=edit           → رفتار قدیمی: همان پیام قبلی را ویرایش می‌کند
+  TGSTORE_NEW_EVERY_MIN=15    → حداقل فاصلهٔ دو پیام تازه (دقیقه) — ضد اسپم
+  TGSTORE_DELETE_OLD=1        → پیام قبلی را بعد از فرستادن پیام تازه پاک می‌کند
 """
 
 import asyncio
 import json
+import os
+import time
 from pathlib import Path
 
 MARKER = "🗂 داده‌های ربات — خودکار، دست نزنید"
@@ -234,54 +242,98 @@ async def init(client, admin_ids, reader=None):
     return False
 
 
-async def _flush():
+# ── حالت بکاپ تلگرامی ────────────────────────────────────────────────────
+MODE_NEW = (os.environ.get("TGSTORE_MODE", "new").strip().lower() != "edit")
+NEW_EVERY_S = max(60.0, float(os.environ.get("TGSTORE_NEW_EVERY_MIN", "15") or 15) * 60.0)
+DELETE_OLD = (os.environ.get("TGSTORE_DELETE_OLD", "").strip().lower() in ("1", "true", "yes", "on"))
+_last_new = {"ts": 0.0}
+
+
+def _due_new() -> bool:
+    """الان اجازهٔ فرستادن پیام تازه هست؟ (تا گروه پر از پیام نشود)"""
+    now = time.time()
+    if now - _last_new["ts"] >= NEW_EVERY_S:
+        _last_new["ts"] = now
+        return True
+    return False
+
+
+async def _flush() -> bool:
+    """True = بکاپ واقعاً نوشته شد | False = چیزی نفرستاد (مثلاً مهلت پیام تازه نرسیده)"""
     c, a = _state["client"], _state["admin"]
     if not c or not a:
-        return
+        return False
     guide = "\n".join(f"{v} \u27f5 {k}" for k, v in SECTION_INFO.items()
                       if k != "user_session.json")
     payload = (MARKER + "\n\ud83d\udccb \u0628\u062e\u0634\u200c\u0647\u0627 (\u0628\u0631\u0627\u06cc \u062d\u0630\u0641 \u062f\u0633\u062a\u06cc\u060c \u0641\u0642\u0637 \u06a9\u0644\u06cc\u062f\u0634 \u0631\u0627 \u062f\u0631 JSON \u067e\u0627\u06a9 \u06a9\u0646):\n"
                + guide + "\nDATA|" + _snapshot())
     # 🔧 اگر بخش «ذخیره»ی گروه تنظیم شده → بکاپ فقط در گروه (چت ادمین تمیز می‌ماند)
-    # گروه نبود → همان روش قدیمی در چت ادمین
     g = _state.get("group")
     if g:
-        try:
-            if _state.get("group_msg") and _state["group_msg"].get("id"):
-                await c.edit_message(g["chat"], _state["group_msg"]["id"], payload)
-            else:
-                m2 = await c.send_message(g["chat"], payload, reply_to=g["topic"])
-                _state["group_msg"] = {"id": m2.id}
-                _save_group_msgid(m2.id)
-            return
-        except Exception:
+        old_id = (_state.get("group_msg") or {}).get("id")
+        if MODE_NEW:
+            if not _due_new():
+                return False            # ویرایش هم نمی‌کنیم — تا نوبت پیام تازه صبر می‌کنیم
             try:
                 m2 = await c.send_message(g["chat"], payload, reply_to=g["topic"])
+                if DELETE_OLD and old_id and old_id != m2.id:
+                    try:
+                        await c.delete_messages(g["chat"], [old_id])
+                    except Exception:
+                        pass
                 _state["group_msg"] = {"id": m2.id}
                 _save_group_msgid(m2.id)
-                return
-            except Exception as e2:
-                print(f"[tgstore] group flush: {str(e2)[:80]} — fallback به چت مدیر", flush=True)
+                print(f"[tgstore] 💾 بکاپ تازه در گروه فرستاده شد (پیام {m2.id})", flush=True)
+                return True
+            except Exception as e:
+                print(f"[tgstore] ارسال پیام تازه به گروه ناموفق: {str(e)[:80]} — fallback به چت مدیر", flush=True)
+        else:
+            try:
+                if old_id:
+                    await c.edit_message(g["chat"], old_id, payload)
+                else:
+                    m2 = await c.send_message(g["chat"], payload, reply_to=g["topic"])
+                    _state["group_msg"] = {"id": m2.id}
+                    _save_group_msgid(m2.id)
+                return True
+            except Exception:
+                try:
+                    m2 = await c.send_message(g["chat"], payload, reply_to=g["topic"])
+                    _state["group_msg"] = {"id": m2.id}
+                    _save_group_msgid(m2.id)
+                    return True
+                except Exception as e2:
+                    print(f"[tgstore] group flush: {str(e2)[:80]} — fallback به چت مدیر", flush=True)
     # بدون گروه (یا گروه ناموفق) → چت ادمین
     try:
+        if MODE_NEW:
+            if not _due_new():
+                return False
+            _state["msg"] = await c.send_message(a, payload)
+            _save_msgid(_state["msg"].id)
+            print(f"[tgstore] 💾 بکاپ تازه در چت مدیر فرستاده شد", flush=True)
+            return True
         if _state["msg"]:
             await c.edit_message(a, _state["msg"].id, payload)
         else:
             _state["msg"] = await c.send_message(a, payload)
             _save_msgid(_state["msg"].id)
+        return True
     except Exception as e:
         print(f"[tgstore] flush: {str(e)[:80]}", flush=True)
         try:
             _state["msg"] = await c.send_message(a, payload)
             _save_msgid(_state["msg"].id)
+            return True
         except Exception:
-            pass
+            return False
 
 
 async def loop():
-    """هر ۲ دقیقه اگر تغییری بوده، در تلگرام ذخیره می‌کند"""
+    """هر ۶۰ ثانیه اگر تغییری بوده، بکاپ را در تلگرام به‌روز می‌کند"""
     while True:
         await asyncio.sleep(60)
         if _state["dirty"] and _state["client"]:
-            _state["dirty"] = False
-            await _flush()
+            # 🔧 dirty فقط وقتی صفر می‌شود که بکاپ واقعاً نوشته شده باشد
+            if await _flush():
+                _state["dirty"] = False

@@ -1,28 +1,24 @@
-🔧 بستهٔ اصلاحی — ۴ فایل + ۱ workflow
+🔧 بستهٔ اصلاحی — نسخهٔ ۳
 
-چرا؟ ریپوی تو با نسخهٔ قدیمی کیت پر شده (همان zip اول، قبل از اینکه
-ذخیره‌سازی را از هاتینگ‌فیس به گیت‌هاب منتقل کنم). با فایل‌های قدیمی:
-  • داده‌ها هیچ‌جا ذخیره نمی‌شوند → هر ۶ ساعت کاربران/منطقه‌ها می‌پرند
-  • restore_from_text.py نیست → بکاپ تلگرامی برنمی‌گردد
+تغییر جدید (به درخواست خودت):
+  بکاپ تلگرامی دیگر پیام قبلی را **ویرایش نمی‌کند**؛ هر بار **پیام تازه**
+  می‌فرستد. برای جلوگیری از پر شدن گروه، حداکثر هر ۱۵ دقیقه یک پیام تازه
+  (فقط وقتی داده‌ای عوض شده باشد).
+
+  سه کلید تنظیم (در تب Variables ریپو — همه اختیاری‌اند):
+    TGSTORE_MODE          = new (پیش‌فرض) | edit (رفتار قدیمی)
+    TGSTORE_NEW_EVERY_MIN = 15   ← فاصلهٔ حداقلی دو پیام تازه (دقیقه)
+    TGSTORE_DELETE_OLD    = 0    ← اگر 1 بگذاری، پیام قبلی را بعد از پیام تازه پاک می‌کند
 
 چه کار کنم؟
-۱) تب Actions → run شمارهٔ #2 (Pending) را Cancel کن، بعد run شمارهٔ #1 (در حال اجرا) را Cancel کن.
-۲) در ریشهٔ ریپو: Add file → Upload files → این ۴ فایل را بکش:
-      persist.py   run_all.py   tgstore.py   restore_from_text.py
-   (روی نسخهٔ قبلی بازنویسی می‌شوند) → Commit changes
-۳) وارد پوشهٔ .github/workflows/ شو → روی bot-24x7.yml کلیک → آیکون مداد ✏️
-   → همهٔ محتوا را پاک کن → محتوای فایل bot-24x7.yml همین بسته را Paste کن
+۱) Actions → run در حال اجرا را Cancel کن.
+۲) ریشهٔ ریپو → Add file → Upload files → این ۴ فایل را بکش (بازنویسی می‌شوند):
+      tgstore.py   run_all.py   persist.py   restore_from_text.py
    → Commit changes
-   (راه جایگزین: در همان پوشه Add file → Upload files و فایل workflow را بکش)
-۴) Settings → Secrets and variables → Actions → تب Secrets → دو Secret جدید بساز:
-      GH_PAT           = توکن گیت‌هاب با تیک repo   (github.com/settings/tokens)
-      TG_BACKUP_TEXT   = کل متن پیام «🗂 داده‌های ربات»
-   (HF_TOKEN و DATA_REPO را اگر ساختی، ولش کن — بی‌اثرند)
-   تب Variables: ENABLE_BOT1=1 و ENABLE_BOT2=0
-۵) بعد از Commit، حداکثر تا ۵ دقیقهٔ دیگر cron خودش اجرای تازه را شروع می‌کند؛
-   یا دستی: Actions → bot-24x7 → Run workflow.
+۳) داخل .github/workflows/ → bot-24x7.yml → مداد ✏️ → Ctrl+A → Delete →
+   محتوای bot-24x7.yml این بسته را Paste → Commit changes
+۴) Actions → bot-24x7 → Run workflow
 
-در لاگ اجرای جدید باید این خط‌ها را ببینی:
-   [seed] ✅ N فایل از بکاپ تلگرامی بازگردانی شد
-   [persist] مخزن خصوصی «<user>/bot-data» ساخته شد ✓
-   [tgstore] N فایل از گروه بازیابی شد ✓ (با ربات)
+در لاگ باید ببینی:
+   [tgstore] 💾 بکاپ تازه در گروه فرستاده شد (پیام <شناسه>)
+و در گروه، یک پیام **جدید** «🗂 داده‌های ربات» در بخش ذخیره ظاهر شود.
