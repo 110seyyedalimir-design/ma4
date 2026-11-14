@@ -11,11 +11,16 @@ name: bot-24x7
 #    • سیگنال TERM → persist.py ذخیرهٔ پایانی می‌کند → داده‌ها نمی‌پرند
 #
 #  پیش‌نیازها:
-#    • Secrets:  BOT_TOKEN, ADMIN_IDS, TG_API_ID, TG_API_HASH, HF_TOKEN
+#    • Secrets:  BOT_TOKEN, ADMIN_IDS, TG_API_ID, TG_API_HASH, GH_PAT
+#                (اختیاری: TG_BACKUP_TEXT برای بازگردانی بکاپ تلگرامی، AI_API_KEY)
 #                (و برای ربات دوم: DOR_BOT_TOKEN, DOR_ADMIN_ID, LICENSE_PRIVATE_KEY)
-#    • Variables: DATA_REPO=yourname/bot-data
-#                 DOR_DATA_REPO=yourname/dorbargardoon-data
+#    • Variables: GH_DATA_REPO=<user>/bot-data   (اختیاری — خودش می‌سازد)
 #                 ENABLE_BOT2=0 یا 1   (بدون URL عمومی، بخش آیفون/DoH کار نمی‌کند)
+#
+#  💾 ذخیره‌سازی دائمی: چون /tmp رانر هر ~۶ ساعت پاک می‌شود، داده‌ها در یک
+#     مخزن **خصوصی** گیت‌هاب (فایل data/bundle.json) نگه داشته می‌شوند.
+#     فقط GH_PAT لازم است؛ مخزن خودش خودکار و خصوصی ساخته می‌شود.
+#     اگر HF_TOKEN هم باشد، اولویت با گیت‌هاب است.
 # ══════════════════════════════════════════════════════════════════════════════
 
 on:
@@ -60,6 +65,15 @@ jobs:
           python -c "import telethon, yt_dlp; print('telethon', telethon.__version__, '| yt-dlp', yt_dlp.version.__version__)"
           echo "دیسک آزاد: $(df -h /tmp | tail -1 | awk '{print $4}')"
 
+      # ── 🌱 بازگردانی از متن بکاپ تلگرامی (اختیاری، یک‌بار مصرف) ───────────────
+      # اگر Secret با نام TG_BACKUP_TEXT ساخته باشی، محتوای پیام «🗂 داده‌های ربات»
+      # را به فایل‌های json در /tmp تبدیل می‌کند. فایل‌هایی که از قبل موجودند
+      # بازنویسی نمی‌شوند، پس نگه‌داشتنش ضرر ندارد.
+      - name: Seed data from Telegram backup (optional)
+        env:
+          TG_BACKUP_TEXT: ${{ secrets.TG_BACKUP_TEXT }}
+        run: python -u restore_from_text.py
+
       # ── اختیاری: تانل Cloudflare برای بخش آیفون/DoH دوربرگردون ──────────────
       # فقط اگر Named Tunnel ساخته‌اید و توکنش را در Secret با نام CF_TUNNEL_TOKEN
       # گذاشته‌اید، کامنت این step را بردارید. آنگاه PUBLIC_URL را در Variables روی
@@ -97,6 +111,10 @@ jobs:
           # ── مشترک ──
           TG_API_ID:           ${{ secrets.TG_API_ID }}
           TG_API_HASH:         ${{ secrets.TG_API_HASH }}
+          # ذخیره‌سازی دائمی — پشتیبان اصلی: یک مخزن **خصوصی** گیت‌هاب (بدون نیاز به HF)
+          GH_PAT:              ${{ secrets.GH_PAT }}          # توکن گیت‌هاب با دسترسی repo
+          GH_DATA_REPO:        ${{ vars.GH_DATA_REPO }}       # اختیاری؛ پیش‌فرض <owner>/bot-data
+          # پشتیبان جایگزین/قدیمی: Hugging Face (اگر اکانت داری)
           HF_TOKEN:            ${{ secrets.HF_TOKEN }}
           DATA_REPO:           ${{ vars.DATA_REPO }}
           DOR_DATA_REPO:       ${{ vars.DOR_DATA_REPO }}
