@@ -160,28 +160,35 @@ async def init(client, admin_ids, reader=None):
         print("[tgstore] مدیری تعریف نشده — غیرفعال", flush=True)
         return False
     # مسیر ۰ (اولویت اول): گروه «مای ربات» (بخش ذخیره) — بکاپ اینجاست
+    # 🔧 پچ: اگر اکانت‌خوان (reader) وصل نباشد، با خودِ ربات هم تلاش می‌شود —
+    # ربات عضو گروه است و می‌تواند پیام بکاپ را با شناسه بخواند (بدون نیاز به یوزربات)
     g = _state.get("group")
-    if g and reader is not None:
-        try:
-            if _state.get("group_msg") and _state["group_msg"].get("id"):
-                m = await reader.get_messages(g["chat"], ids=_state["group_msg"]["id"])
-                if m and m.text and m.text.startswith(MARKER) and "DATA|" in m.text:
-                    n = _restore(m.text.split("DATA|", 1)[1], source="گروه ✅")
-                    print(f"[tgstore] {n} فایل از گروه بازیابی شد ✓", flush=True)
-                    if n:
-                        return True
-            async for m in reader.iter_messages(g["chat"], limit=150,
-                                                reply_to=g["topic"]):
-                if m.text and m.text.startswith(MARKER) and "DATA|" in m.text:
-                    _save_group_msgid(m.id)
-                    _state["group_msg"] = {"id": m.id}
-                    n = _restore(m.text.split("DATA|", 1)[1], source="گروه ✅")
-                    print(f"[tgstore] {n} فایل از گروه بازیابی شد ✓ (جستجو)", flush=True)
-                    if n:
-                        return True
-                    break
-        except Exception as e:
-            print(f"[tgstore] جستجوی گروه: {e}", flush=True)
+    if g:
+        for _who, _s in (("اکانت‌خوان", reader), ("ربات", client)):
+            if _s is None:
+                continue
+            try:
+                _gid = (_state.get("group_msg") or {}).get("id")
+                if _gid:
+                    m = await _s.get_messages(g["chat"], ids=_gid)
+                    if m and m.text and m.text.startswith(MARKER) and "DATA|" in m.text:
+                        n = _restore(m.text.split("DATA|", 1)[1], source="گروه ✅")
+                        print(f"[tgstore] {n} فایل از گروه بازیابی شد ✓ (با {_who})", flush=True)
+                        if n:
+                            return True
+                if _s is not client:      # گشتن در تاریخچه فقط با اکانت‌خوان ممکن است
+                    async for m in _s.iter_messages(g["chat"], limit=150,
+                                                    reply_to=g["topic"]):
+                        if m.text and m.text.startswith(MARKER) and "DATA|" in m.text:
+                            _save_group_msgid(m.id)
+                            _state["group_msg"] = {"id": m.id}
+                            n = _restore(m.text.split("DATA|", 1)[1], source="گروه ✅")
+                            print(f"[tgstore] {n} فایل از گروه بازیابی شد ✓ (جستجو)", flush=True)
+                            if n:
+                                return True
+                            break
+            except Exception as e:
+                print(f"[tgstore] جستجوی گروه ({_who}): {e}", flush=True)
 
     # مسیر ۱: شناسه‌ی پیام ذخیره‌شده (چت مدیر — پشتیبان)
     mid = None

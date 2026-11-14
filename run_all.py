@@ -154,6 +154,58 @@ def _shutdown(signum, _frame):
     sys.exit(0)
 
 
+def seed_from_backup():
+    """اگر TG_BACKUP_TEXT پر بود، داده‌های بکاپ تلگرامی را به /tmp برگردان
+    (فقط فایل‌های خالی پر می‌شوند، پس تکرارش بی‌خطر است)"""
+    if not (os.environ.get("TG_BACKUP_TEXT") or "").strip():
+        return
+    if not os.path.exists("restore_from_text.py"):
+        log("TG_BACKUP_TEXT هست ولی restore_from_text.py پیدا نشد — رد شد")
+        return
+    try:
+        subprocess.run([sys.executable, "-u", "restore_from_text.py"], timeout=120)
+    except Exception as e:
+        log(f"⚠️ بازگردانی از بکاپ تلگرامی ناموفق: {e}")
+
+
+def preflight():
+    """🔎 چک سریع پیش از شروع — به‌جای اینکه ربات ۶ ساعت در حلقهٔ کرش بماند و
+    هیچ علامتی نبینی، اگر Secret مهمی خالی باشد فوراً با پیام خوانا خارج می‌شود."""
+    problems, warnings = [], []
+
+    if ENABLE_BOT1:
+        for k, fa in (("BOT_TOKEN", "توکن ربات آچارفرانسه (از @BotFather)"),
+                      ("TG_API_ID", "api_id عددی از my.telegram.org"),
+                      ("TG_API_HASH", "api_hash از my.telegram.org")):
+            if not (os.environ.get(k) or "").strip():
+                problems.append(f"{k} خالی است — {fa}")
+
+    if ENABLE_BOT2:
+        if not (os.environ.get("DOR_BOT_TOKEN") or "").strip():
+            problems.append("DOR_BOT_TOKEN خالی است (ENABLE_BOT2=1 گذاشته‌ای) — "
+                            "یا اگر ربات دوم را نمی‌خواهی، ENABLE_BOT2=0 بگذار")
+        if not ((os.environ.get("PUBLIC_URL") or "").strip()
+                or (os.environ.get("IOS_PUBLIC_URL") or "").strip()):
+            warnings.append("PUBLIC_URL خالی است → اشتراک آیفون/DoH صادر نمی‌شود")
+
+    if not ((os.environ.get("GH_PAT") or "").strip() or (os.environ.get("HF_TOKEN") or "").strip()):
+        warnings.append("⚠️ نه GH_PAT داری نه HF_TOKEN → داده‌ها هیچ‌جا ذخیره نمی‌شوند "
+                        "و با هر ری‌استارت (هر ~۶ ساعت) کاربران/منطقه‌ها می‌پرند!")
+
+    for w in warnings:
+        log(w)
+
+    if problems:
+        log("═" * 62)
+        log("❌ اجرا متوقف شد — این Secretها/Variables خالی یا اشتباه‌اند:")
+        for p in problems:
+            log(f"     • {p}")
+        log("👈 مسیر ساخت: ریپو → Settings → Secrets and variables → Actions")
+        log("   (نام‌ها باید دقیقاً همین باشند؛ بعد از ساخت، Run workflow بزن)")
+        log("═" * 62)
+        sys.exit(2)
+
+
 def main():
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
@@ -162,10 +214,8 @@ def main():
         log("هر دو ربات غیرفعال‌اند! ENABLE_BOT1 یا ENABLE_BOT2 را 1 بگذارید.")
         sys.exit(1)
 
-    if not os.environ.get("PUBLIC_URL") and ENABLE_BOT2:
-        log("⚠️ PUBLIC_URL تنظیم نشده — بخش آیفون/DoH دوربرگردون لینک صادر نمی‌کند. "
-            "آدرس عمومی سرویس را در PUBLIC_URL (یا IOS_PUBLIC_URL) بگذارید.")
-
+    preflight()
+    seed_from_backup()
     ensure_ffmpeg()
     log(f"شروع… bot1={ENABLE_BOT1} bot2={ENABLE_BOT2} PORT={PORT}")
 
