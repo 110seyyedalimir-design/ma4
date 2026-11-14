@@ -124,6 +124,10 @@ jobs:
           DATA_REPO:           ${{ vars.DATA_REPO }}
           DOR_DATA_REPO:       ${{ vars.DOR_DATA_REPO }}
           # ── رفتار ──
+          # بکاپ تلگرامی: new = پیام تازه (پیش‌فرض) | edit = ویرایش پیام قبلی
+          TGSTORE_MODE:          ${{ vars.TGSTORE_MODE || 'new' }}
+          TGSTORE_NEW_EVERY_MIN: ${{ vars.TGSTORE_NEW_EVERY_MIN || '15' }}
+          TGSTORE_DELETE_OLD:    ${{ vars.TGSTORE_DELETE_OLD || '0' }}
           ENABLE_BOT1:         ${{ vars.ENABLE_BOT1 || '1' }}
           ENABLE_BOT2:         ${{ vars.ENABLE_BOT2 || '0' }}
           PERSIST_SECONDS:     "30"          # ذخیرهٔ داده هر ۳۰ ثانیه (ری‌استارت ۶ ساعته)
