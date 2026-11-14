@@ -59,9 +59,14 @@ jobs:
 
       - name: Check environment
         run: |
+          # اگر ffmpeg یا ffprobe روی رانر نبود، نصبش کن (فشرده‌سازی/استخراج صوت به هر دو نیاز دارد)
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            echo "⬇️ ffmpeg/ffprobe پیدا نشد — در حال نصب…"
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          fi
           echo "ffmpeg:  $(command -v ffmpeg || echo MISSING)"
           echo "ffprobe: $(command -v ffprobe || echo MISSING)"
-          ffmpeg -hide_banner -version | head -1
+          (ffmpeg -hide_banner -version 2>/dev/null | head -1) || true
           python -c "import telethon, yt_dlp; print('telethon', telethon.__version__, '| yt-dlp', yt_dlp.version.__version__)"
           echo "دیسک آزاد: $(df -h /tmp | tail -1 | awk '{print $4}')"
 
