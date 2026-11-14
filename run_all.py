@@ -170,15 +170,52 @@ def seed_from_backup():
 
 def preflight():
     """🔎 چک سریع پیش از شروع — به‌جای اینکه ربات ۶ ساعت در حلقهٔ کرش بماند و
-    هیچ علامتی نبینی، اگر Secret مهمی خالی باشد فوراً با پیام خوانا خارج می‌شود."""
+    هیچ علامتی نبینی، اگر Secret مهمی خالی یا بدشکل باشد فوراً با پیام خوانا خارج می‌شود.
+    ⚠️ مقدار Secretها هرگز چاپ نمی‌شود (فقط طول و شکلشان)."""
     problems, warnings = [], []
+
+    def _val(k):
+        return (os.environ.get(k) or "").strip()
+
+    def _bad_masked(k, v):
+        """مقداری که از جای مخفی کپی شده (مثل *** در Secrets اسپیس HF)"""
+        if set(v) <= {"*"} or v in ("...", "—", "-"):
+            problems.append(
+                f"{k} = «{v}» است، یعنی مقدار واقعی نیست! این را از جایی کپی کرده‌ای که مقدار را "
+                f"مخفی نشان می‌داد (مثلاً Secrets اسپیس HF که *** نمایش می‌دهد و کپی کردنش فایده ندارد). "
+                f"مقدار واقعی را از مبدأ اصلی بگیر: TG_API_ID و TG_API_HASH از my.telegram.org → "
+                f"API development tools، و BOT_TOKEN از @BotFather.")
 
     if ENABLE_BOT1:
         for k, fa in (("BOT_TOKEN", "توکن ربات آچارفرانسه (از @BotFather)"),
                       ("TG_API_ID", "api_id عددی از my.telegram.org"),
                       ("TG_API_HASH", "api_hash از my.telegram.org")):
-            if not (os.environ.get(k) or "").strip():
+            if not _val(k):
                 problems.append(f"{k} خالی است — {fa}")
+
+        api_id, api_hash, bot_tok = _val("TG_API_ID"), _val("TG_API_HASH"), _val("BOT_TOKEN")
+
+        if api_id:
+            _bad_masked("TG_API_ID", api_id)
+            if not api_id.isdigit():
+                problems.append(
+                    f"TG_API_ID باید **فقط رقم** باشد (مثل 12345678) — ولی مقدار فعلی {len(api_id)} کاراکتر "
+                    f"است و رقم نیست. احتمالاً api_hash را جای api_id گذاشته‌ای، یا موقع کپی فاصله/کوتیشن/"
+                    f"خط جدید چسبیده. در my.telegram.org → API development tools عدد api_id را جدا کپی کن.")
+
+        if api_hash:
+            _bad_masked("TG_API_HASH", api_hash)
+            if len(api_hash) != 32 or any(c not in "0123456789abcdefABCDEF" for c in api_hash):
+                problems.append(
+                    f"TG_API_HASH باید **دقیقاً ۳۲ کاراکتر هگز** (0-9 و a-f) باشد — مقدار فعلی "
+                    f"{len(api_hash)} کاراکتر است. شاید api_id را جای آن گذاشته‌ای یا ناقص کپی شده.")
+
+        if bot_tok:
+            _bad_masked("BOT_TOKEN", bot_tok)
+            if ":" not in bot_tok:
+                problems.append(
+                    f"BOT_TOKEN باید شکل «عدد:رشته» داشته باشد (مثل 123456789:AAE...) — مقدار فعلی "
+                    f"{len(bot_tok)} کاراکتر است و «:» ندارد.")
 
     if ENABLE_BOT2:
         if not (os.environ.get("DOR_BOT_TOKEN") or "").strip():
