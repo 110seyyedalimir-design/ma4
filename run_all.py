@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+سوپروایزر پرتابل — جایگزین app.py برای هر پلتفرمی غیر از Hugging Face
+(Northflank / Render / Back4App / Oracle VPS / Docker / GitHub Actions)
+
+چرا این فایل؟
+  app.py فقط برای اسپیس HF نوشته شده (Gradio + تابع الکی ZeroGPU + پروکسی 7861).
+  بیرون از HF هیچ‌کدام لازم نیست: dor_bot.py خودش سرور HTTP دارد و روی
+  0.0.0.0:PORT مسیرهای /dns-query/<token> و /ios/… و /health را سرو می‌کند.
+  bot.py هم هیچ پورتی نمی‌خواهد (Telethon = فقط ارتباط خروجی).
+
+متغیرهای محیطی:
+  PORT              پورت عمومی سرویس (پلتفرم معمولاً خودش تزریق می‌کند) — پیش‌فرض 7860
+  ENABLE_BOT1       اجرای ربات آچارفرانسه (bot.py)        — پیش‌فرض 1
+  ENABLE_BOT2       اجرای ربات دوربرگردون (dor_bot.py)    — پیش‌فرض 1
+  BOT2_PORT         پورت داخلی dor_bot (اگر با PORT فرق دارد)
+  PUBLIC_URL        آدرس عمومی HTTPS سرویس — برای لینک‌های آیفون لازم است
+                    (روی HF این از SPACE_HOST ساخته می‌شد؛ اینجا باید دستی بدهید)
+  HF_TOKEN, DATA_REPO  برای ذخیره‌سازی دائمی داده‌ها (همان مکانیزم قبلی)
+
+نکته: اگر ENABLE_BOT2=0 باشد ولی پلتفرم پورت بخواهد (مثل Render)، این فایل
+خودش یک سرور /health روی PORT بالا می‌آورد تا سرویس «وب» شناخته شود.
+"""
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = (os.environ.get("PORT") or "7860").strip()
+BOT2_PORT = (os.environ.get("BOT2_PORT") or PORT).strip()
+
+
+def _flag(name: str, default: bool = True) -> bool:
+    v = (os.environ.get(name) or "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "on", "enabled")
+
+
+ENABLE_BOT1 = _flag("ENABLE_BOT1", True)
+ENABLE_BOT2 = _flag("ENABLE_BOT2", True)
+
+_stop = threading.Event()
+_procs = []
+
+
+def log(msg: str):
+    print(f"[supervisor] {msg}", flush=True)
+
+
+def ensure_ffmpeg():
+    """ffmpeg سیستم (apt) ترجیح دارد؛ اگر نبود، نسخهٔ همراه static-ffmpeg"""
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        log("ffmpeg سیستم پیدا شد ✓")
+        return
+    try:
+        from static_ffmpeg import add_paths
+        log("در حال آماده‌سازی ffmpeg همراه…")
+        add_paths()
+        log("ffmpeg همراه آماده شد ✓")
+    except Exception as e:
+        log(f"⚠️ ffmpeg آماده نشد: {e} (فشرده‌سازی/صوت کار نخواهد کرد)")
+
+
+def _pipe(proc, label):
+    try:
+        for line in proc.stdout:
+            print(f"[{label}] {line.rstrip()}", flush=True)
+    except Exception:
+        pass
+
+
+def run_script(script: str, label: str, extra_env=None):
+    """اجرای یک اسکریپت با ری‌استارت خودکار تا زمانی که سوپروایزر زنده است"""
+    env = dict(os.environ)
+    env.update(extra_env or {})
+    while not _stop.is_set():
+        started = time.time()
+        try:
+            p = subprocess.Popen(
+                [sys.executable, "-u", script],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+        except Exception as e:
+            log(f"{label}: خطا در اجرا → {e}")
+            _stop.wait(5)
+            continue
+        _procs.append(p)
+        threading.Thread(target=_pipe, args=(p, label), daemon=True).start()
+        code = p.wait()
+        up = int(time.time() - started)
+        log(f"{label}: خارج شد (کد {code}) بعد از {up} ثانیه — ری‌استارت در ۵ ثانیه")
+        if _stop.is_set():
+            break
+        _stop.wait(5)
+
+
+class _Health(BaseHTTPRequestHandler):
+    server_version = "bot-supervisor"
+
+    def log_message(self, *a):
+        pass
+
+    def _ok(self, body=b"ok"):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def do_GET(self):
+        self._ok()
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+def serve_health(port: str):
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", int(port)), _Health)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        log(f"سرور /health روی پورت {port} بالا آمد (برای زنده نگه‌داشتن سرویس)")
+    except Exception as e:
+        log(f"⚠️ سرور health بالا نیامد: {e}")
+
+
+def _shutdown(signum, _frame):
+    log(f"سیگنال {signum} — خاموش کردن ربات‌ها…")
+    _stop.set()
+    for p in list(_procs):
+        try:
+            if p.poll() is None:
+                p.terminate()
+        except Exception:
+            pass
+    time.sleep(3)
+    for p in list(_procs):
+        try:
+            if p.poll() is None:
+                p.kill()
+        except Exception:
+            pass
+    sys.exit(0)
+
+
+def main():
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    if not ENABLE_BOT1 and not ENABLE_BOT2:
+        log("هر دو ربات غیرفعال‌اند! ENABLE_BOT1 یا ENABLE_BOT2 را 1 بگذارید.")
+        sys.exit(1)
+
+    if not os.environ.get("PUBLIC_URL") and ENABLE_BOT2:
+        log("⚠️ PUBLIC_URL تنظیم نشده — بخش آیفون/DoH دوربرگردون لینک صادر نمی‌کند. "
+            "آدرس عمومی سرویس را در PUBLIC_URL (یا IOS_PUBLIC_URL) بگذارید.")
+
+    ensure_ffmpeg()
+    log(f"شروع… bot1={ENABLE_BOT1} bot2={ENABLE_BOT2} PORT={PORT}")
+
+    if ENABLE_BOT2:
+        dor_env = {"PORT": BOT2_PORT}
+        # هر دو ربات متغیر DATA_REPO را می‌خوانند؛ اگر یکی باشد داده‌ها قاطی می‌شوند!
+        # DOR_DATA_REPO را جدا بدهید (مثلاً yourname/dorbargardoon-data)
+        dor_repo = (os.environ.get("DOR_DATA_REPO") or "").strip()
+        if dor_repo:
+            dor_env["DATA_REPO"] = dor_repo
+        elif (os.environ.get("DATA_REPO") or "").strip():
+            log("⚠️ DOR_DATA_REPO تنظیم نشده — دوربرگردون از همان DATA_REPO ربات اول استفاده می‌کند "
+                "(بهتر است دو مخزن جدا بدهید: bot-data و dorbargardoon-data)")
+        threading.Thread(target=run_script, args=("dor_bot.py", "dor_bot", dor_env),
+                         daemon=True).start()
+    else:
+        # پلتفرم‌های «وب‌سرویس» یک پورت شنونده می‌خواهند
+        serve_health(PORT)
+
+    if ENABLE_BOT1:
+        threading.Thread(target=run_script, args=("bot.py", "bot", {}), daemon=True).start()
+
+    while not _stop.is_set():
+        _stop.wait(30)
+
+
+if __name__ == "__main__":
+    main()

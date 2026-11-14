@@ -1,0 +1,16 @@
+telethon>=1.36
+pillow>=10.0
+static-ffmpeg>=2.0
+yt-dlp>=2026.8
+edge-tts
+arabic-reshaper
+python-bidi
+jdatetime
+py-mini-racer
+pyfiglet
+cryptography
+tzdata
+huggingface_hub
+dnspython>=2.6
+httpx
+requests
