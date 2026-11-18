@@ -417,6 +417,8 @@ async def _stale_guard(e):
             sender_id = e.sender_id
         except Exception:
             sender_id = None
+        if sender_id in ADMIN_IDS:
+            return                       # دکمه/پیام مدیر همیشه اجرا می‌شود
         if time.time() - _STARTUP_TS < 20 and sender_id not in ADMIN_IDS:
             raise events.StopPropagation()
         m = getattr(e, "message", None)
@@ -10668,6 +10670,7 @@ def _bc_room_card(room):
                 f"📎 رسانه: {_bc_media_name(media)}\n\n"
                 "اگر همه‌چیز درست است «📤 ارسال نهایی» را بزن.")
         kb = [[Button.inline(f"📤 ارسال نهایی به {cnt} نفر", b"bcr:go")],
+              [Button.inline("🧪 تست به خودم", b"bcr:test")],
               [Button.inline("✏️ ویرایش", b"bcr:edit"),
                Button.inline("👥 تغییر گروه", b"bcr:grp")],
               [Button.inline("❌ لغو و خروج", b"bcr:cancel")]]
@@ -10840,88 +10843,135 @@ async def _bc_apply_delete(chat):
         buttons=[[Button.inline("🔙 منوی پیام‌رسانی", b"bcr:menu")]])
 
 
-async def _bc_send(room, panel):
-    """ارسال نهایی با نوار پیشرفت، توقف، و ثبت شناسه‌ها برای ویرایش/حذف بعدی."""
+async def _bc_send_one(uid, text, media):
+    """ارسال یک پیام با چند مسیر جایگزین. خروجی: (message_id یا None، متن خطا)"""
     from telethon.errors import FloodWaitError
-    chat = panel.chat_id
-    grp = room.get("grp") or "all"
-    targets = _bc_room_targets(room)
-    text = (room.get("text") or "").strip()
-    media = room.get("media")
-    if media and not Path(str(media)).exists():
-        media = None
-        room["media"] = None
-    if not targets:
-        t, k = _bc_room_card(room)
-        await panel.edit("😕 برای این گروه هیچ گیرنده‌ای پیدا نشد.\n\n" + t, buttons=k)
-        return
-    total = len(targets)
-    room["step"] = "sending"
-    room["abort"] = False
-    _bc_rooms_save()
-    stop_kb = [[Button.inline("⏹ توقف", b"bcr:stop")]]
-    item = {"rid": room.get("rid"), "ts": time.time(),
-            "kind": ("media" if media else "text"), "text": text,
-            "media": (Path(str(media)).name if media else ""),
-            "group": grp, "ids": []}
-    ok = fail = 0
-    last_err = ""
+    txt = (text or "").strip()
+    plans = [
+        ("عادی", dict(file=media, link_preview=False)),
+        ("بدون مارک‌داون", dict(file=media, parse_mode=None)),
+        ("فقط متن", dict(file=None, parse_mode=None, link_preview=False)),
+    ]
+    last = ""
+    for _name, kw in plans:
+        try:
+            m = await asyncio.wait_for(
+                client.send_message(int(uid), txt or " ", **kw), timeout=120)
+            return getattr(m, "id", None), ""
+        except FloodWaitError as fw:
+            w = min(int(getattr(fw, "seconds", 5) or 5), 45)
+            last = f"⏳ محدودیت تلگرام ({w} ثانیه)"
+            await asyncio.sleep(w)
+        except asyncio.TimeoutError:
+            last = "⏱ تلگرام جواب نداد"
+        except Exception as ex:
+            last = f"{type(ex).__name__}: {str(ex)[:90]}"
+    return None, last
+
+
+async def _bc_send(room, panel, notify_chat=None):
+    """ارسال نهایی: شروعِ قابل‌دیدن + پیشرفت زنده + توقف + گزارش خطای واقعی."""
+    chat = notify_chat or getattr(panel, "chat_id", None) or next(iter(ADMIN_IDS))
     try:
-        await panel.edit(f"📣 ارسال به {total} نفر شروع شد…", buttons=stop_kb)
-    except Exception:
-        pass
-    for n, uid in enumerate(targets, 1):
-        if room.get("abort"):
-            break
-        sent_id = None
-        for attempt in (1, 2):
-            try:
-                m = await asyncio.wait_for(
-                    client.send_message(uid, text or " ", file=media, link_preview=False),
-                    timeout=120)
-                sent_id = getattr(m, "id", None)
+        if (room.get("grp") or "all") == "custom" and not (room.get("picks") or []):
+            room["grp"] = "all"
+        targets = _bc_room_targets(room)
+        text = (room.get("text") or "").strip()
+        media = room.get("media")
+        if media and not Path(str(media)).exists():
+            media = None
+            room["media"] = None
+        if not targets:
+            t, k = _bc_room_card(room)
+            await client.send_message(
+                chat,
+                "😕 هیچ گیرنده‌ای پیدا نشد.\\n"
+                "یعنی هنوز هیچ کاربری با ربات کار نکرده یا انتخاب‌ها خالی است.\\n\\n" + t,
+                buttons=k)
+            return
+        total = len(targets)
+        room["step"] = "sending"
+        room["abort"] = False
+        _bc_rooms_save()
+        stop_kb = [[Button.inline("⏹ توقف", b"bcr:stop")]]
+
+        # پیام شروع (جدا از کارت → حتماً دیده می‌شود)
+        prog = None
+        try:
+            prog = await client.send_message(
+                chat,
+                f"🚀 ارسال شروع شد — به {total} نفر…\\n"
+                f"{'📎 با رسانه' if media else '📝 متنی'}",
+                buttons=stop_kb)
+        except Exception:
+            pass
+        try:
+            await panel.edit(f"📣 در حال ارسال به {total} نفر…", buttons=stop_kb)
+        except Exception:
+            pass
+
+        item = {"rid": room.get("rid"), "ts": time.time(),
+                "kind": ("media" if media else "text"), "text": text,
+                "media": (Path(str(media)).name if media else ""),
+                "group": room.get("grp") or "all", "ids": []}
+        ok = 0
+        fails = []
+        for n, uid in enumerate(targets, 1):
+            if room.get("abort"):
                 break
-            except FloodWaitError as fw:
-                w = min(int(getattr(fw, "seconds", 5) or 5), 45)
-                last_err = f"⚠️ محدودیت تلگرام؛ {w} ثانیه صبر…"
+            mid, err = await _bc_send_one(uid, text, media)
+            if mid:
+                ok += 1
+                item["ids"].append([int(uid), int(mid)])
+            else:
+                nm = (users_seen.get(str(uid)) or {}).get("uname") or str(uid)
+                fails.append((f"@{nm}" if not str(nm).isdigit() else nm, err))
+            if (n % 5 == 0 or n == total) and prog is not None:
+                line = f"📣 ارسال… {n}/{total}\\n✅ {ok}   ❌ {len(fails)}"
+                if fails:
+                    line += f"\\nآخرین خطا: {fails[-1][1][:70]}"
                 try:
-                    await panel.edit(f"📣 ارسال… {n}/{total}\n{last_err}", buttons=stop_kb)
+                    await prog.edit(line, buttons=stop_kb)
                 except Exception:
                     pass
-                await asyncio.sleep(w)
-            except asyncio.TimeoutError:
-                last_err = "⏱ تلگرام پاسخ نداد → رد شد"
-                break
-            except Exception as ex:
-                last_err = f"❌ {type(ex).__name__}"
-                break
-        if sent_id:
-            ok += 1
-            item["ids"].append([int(uid), int(sent_id)])
+            await asyncio.sleep(0.4)
+
+        item["ids"] = item["ids"][:BC_SENT_MAX]
+        if item["ids"]:
+            _bc_sent_push(item)
+        room["step"] = "done"
+        room["sent_ok"], room["sent_fail"] = ok, len(fails)
+        _bc_rooms_save()
+        _, k = _bc_room_card(room)
+        summary = (f"{'⏹ متوقف شد' if room.get('abort') else '✅ ارسال تمام شد'}\\n\\n"
+                   f"👥 کل: {total}   ✅ موفق: {ok}   ❌ ناموفق: {len(fails)}")
+        if fails:
+            summary += "\\n\\n🔎 نمونهٔ خطاها:\\n" + "\\n".join(
+                f"• {nm}: {er[:80]}" for nm, er in fails[:5])
+            if ok == 0:
+                summary += ("\\n\\n💡 اگر همه ناموفق بودند: هر کاربر باید حداقل یک‌بار "
+                            "روی /start یا دکمه‌ای از ربات بزند تا ربات اجازهٔ پیام‌دادن بگیرد.")
         else:
-            fail += 1
-        if n % 10 == 0 or n == total:
+            summary += "\\n\\n(پیام‌ها همین حالا در چت گیرنده‌ها نشست ✅)"
+        done = False
+        for target in (prog, panel):
+            if target is None:
+                continue
             try:
-                await panel.edit(f"📣 ارسال… {n}/{total}\n✅ {ok}   ❌ {fail}"
-                                 + (f"\n{last_err}" if last_err else ""), buttons=stop_kb)
+                await target.edit(summary, buttons=k)
+                done = True
+                break
             except Exception:
-                pass
-        await asyncio.sleep(0.4)
-    item["ids"] = item["ids"][:BC_SENT_MAX]
-    if item["ids"]:
-        _bc_sent_push(item)
-    room["step"] = "done"
-    room["sent_ok"], room["sent_fail"] = ok, fail
-    _bc_rooms_save()
-    _, k = _bc_room_card(room)
-    summary = (f"{'⏹ متوقف شد' if room.get('abort') else '✅ ارسال تمام شد'}\n\n"
-               f"👥 کل: {total}   ✅ موفق: {ok}   ❌ ناموفق: {fail}\n"
-               "(ناموفق‌ها معمولاً کسانی‌اند که ربات را بلاک کرده‌اند.)\n\n"
-               "می‌توانی همین حالا ویرایش یا حذف کنی:")
-    try:
-        await panel.edit(summary, buttons=k)
-    except Exception:
-        await client.send_message(chat, summary, buttons=k)
+                continue
+        if not done:
+            await client.send_message(chat, summary, buttons=k)
+    except Exception as ex:
+        try:
+            await client.send_message(
+                chat, f"❌ ارسال با خطا متوقف شد:\\n{type(ex).__name__}: {str(ex)[:300]}\\n\\n"
+                      "این متن را برای پشتیبانی بفرست.")
+        except Exception:
+            pass
 
 
 async def _bc_room_capture(e):
@@ -11148,13 +11198,42 @@ async def bc_room_cb(e):
         await _render()
         return
 
+    if data == "bcr:test":
+        if not room.get("grp"):
+            room["grp"] = "all"
+        text = (room.get("text") or "").strip()
+        media = room.get("media")
+        if media and not Path(str(media)).exists():
+            media = None
+        try:
+            await e.answer("دارم تست می‌کنم…")
+        except Exception:
+            pass
+        mid, err = await _bc_send_one(chat, text or "(تست)", media)
+        if mid:
+            await client.send_message(
+                chat, "✅ تست موفق بود — همین متن/رسانه به خودت رسید.\n"
+                      "پس اگر کاربران پیامی نگرفتند، اول باید /start بزنند یا ربات را بلاک نکرده باشند.")
+        else:
+            await client.send_message(
+                chat, f"❌ تست هم ناموفق بود:\n{err}\n\n"
+                      "همین خطا دلیل ارسال‌نشدن است — متنش را برایم بفرست تا رفع کنم.")
+        return
+
     if data == "bcr:go":
         if not room.get("grp"):
             await e.answer("اول گروه گیرنده را انتخاب کن.", alert=True)
             return
         room["step"] = "sending"
         _bc_rooms_save()
-        await _bc_send(room, e.message)
+        try:
+            await _bc_send(room, e.message)
+        except Exception as ex:
+            try:
+                await client.send_message(
+                    chat, f"❌ ارسال شروع نشد:\n{type(ex).__name__}: {str(ex)[:300]}")
+            except Exception:
+                pass
         return
 
     if data == "bcr:stop":
