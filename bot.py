@@ -273,6 +273,59 @@ def _feat_of_label(t):
     return BTN_FEAT.get(_plain_label(t))
 
 
+ROOM_KINDS = {
+    "compress":   "🗜 کم‌حجم کردن",
+    "tag":        "🏷 تگ فایل",
+    "sd":         "📸 عکس خودمحو",
+    "dl":         "📥 کانال محدود",
+    "stt":        "🎙 ویس به متن",
+    "link":       "🔗 فایل به لینک",
+    "insta":      "📸 اینستاگرام",
+    "goldsearch": "🔍 جستجوی کاربر",
+}
+ROOM_EXIT_BTN = "✖ خروج از بخش"
+# دکمه‌های منوی اصلی که داخل اتاق نباید کار کنند
+MENU_LABELS = frozenset([
+    BTN_HELP, BTN_STATUS, BTN_ADMIN, BTN_BARGH, BTN_SUPPORT, BTN_ANTEN,
+    BTN_SELFDES, BTN_AI, BTN_STT, BTN_LINK, BTN_YT, BTN_INSTA, BTN_FINDER,
+    BTN_SUB, BTN_DL, BTN_TAG, BTN_COMP, BTN_PROFILE,
+])
+
+
+def room_kb():
+    """کیبورد اتاق: منوی اصلی پنهان می‌شود، فقط خروج می‌ماند."""
+    return [[Button.text(BTN_HOME, resize=True)],
+            [Button.text(ROOM_EXIT_BTN, resize=True)]]
+
+
+async def _room_guard_early(e):
+    """داخل اتاق ایزوله: به هیچ دکمهٔ منوی اصلی جواب نده (فقط مطالب همان بخش)."""
+    try:
+        if getattr(e, "out", False):
+            return
+        st = globals().get("flow", {}).get(e.chat_id) or {}
+        kind = st.get("kind")
+        if kind not in ROOM_KINDS:
+            return
+        txt = (getattr(e, "raw_text", None) or getattr(e, "text", "") or "").strip()
+        if not txt:
+            return                                    # فایل/رسانه → بخش خودش
+        plain = _plain_label(txt)
+        if plain in (BTN_HOME, ROOM_EXIT_BTN) or txt in (ROOM_EXIT_BTN, "/home", "/exit",
+                                                        "/start", "/cancel", "/end"):
+            return                                    # خروج آزاد است
+        if plain in MENU_LABELS:
+            await e.reply(
+                f"🔒 داخل اتاق «{ROOM_KINDS[kind]}» هستی — فعلاً فقط مطالب همین بخش کار می‌کند.\n\n"
+                "برای خروج: «🏠 منوی اصلی» یا «✖ خروج از بخش»",
+                buttons=room_kb())
+            raise events.StopPropagation
+    except events.StopPropagation:
+        raise
+    except Exception:
+        pass
+
+
 async def _locked_feat_early(e):
     """دکمهٔ یک قابلیتِ خاموش‌شده → فقط همان یک پیام: «فعلاً این امکان غیرفعال است.»
 
@@ -392,6 +445,7 @@ async def _bc_room_early(e):
     if fn is None:
         return
     await fn(e)
+client.add_event_handler(_room_guard_early, events.NewMessage())   # اتاق ایزوله: منو پاسخ ندهد
 client.add_event_handler(_locked_feat_early, events.NewMessage())  # قابلیت خاموش → یک پیام
 client.add_event_handler(_bc_room_early, events.NewMessage())   # اتاق پیام‌رسانی: قبل از همهٔ بخش‌ها
 PROCESS_START = time.time()
@@ -615,24 +669,58 @@ def _kl(label):
     return label
 
 
+# چیدمان کیبورد: هر ردیف = دکمه‌های مرتبط با هم
+KB_LAYOUT = [
+    [BTN_COMP, BTN_TAG],        # فایل: کم‌حجم + تگ
+    [BTN_DL, BTN_LINK],         # فایل: کانال محدود + لینک
+    [BTN_YT, BTN_INSTA],        # دانلود از اینترنت
+    [BTN_AI, BTN_STT],          # هوش مصنوعی + ویس به متن
+    [BTN_BARGH, BTN_ANTEN],     # خبر/شبکه: برق + آنتن
+    [BTN_SELFDES, BTN_FINDER],  # امنیت: خودمحو + مزاحم‌یاب
+]
+
+
 def kb_for(chat_id):
-    """کیبورد اصلی — هر دکمهٔ قابلیت با _kl (خاموش ⇒ خط‌خورده)."""
-    rows = [[Button.text(_kl(BTN_COMP), resize=True), Button.text(BTN_HELP)]]
+    """کیبورد اصلی:
+    • دکمه‌های هم‌خانواده کنار هم
+    • دکمه‌های قابلیت‌های خاموش‌شده می‌روند ته کیبورد (خط‌خورده + «(غیرفعال)»)
+    """
+    live_rows, dead = [], []
+    for grp in KB_LAYOUT:
+        row = []
+        for lb in grp:
+            key = BTN_FEAT.get(lb)
+            if key and not feature_enabled(key):
+                dead.append(lb)                      # خاموش ⇒ ته کیبورد
+            else:
+                row.append(lb)
+        if row:
+            live_rows.append(row)
+    # ردیف‌های تک‌دکمه‌ای (وقتی جفتش خاموش شده) با هم جفت شوند تا کیبورد درهم نباشد
+    merged = []
+    for row in live_rows:
+        if merged and len(merged[-1]) == 1 and len(row) == 1:
+            merged[-1] = merged[-1] + row
+        else:
+            merged.append(row)
+    live_rows = merged
+    rows = []
+    for n, row in enumerate(live_rows):
+        rows.append([Button.text(_kl(lb), resize=(n == 0 and k == 0))
+                     for k, lb in enumerate(row)])
+    # حساب کاربر
+    rows.append([Button.text(BTN_PROFILE), Button.text(BTN_SUB)])
+    # کمک
+    rows.append([Button.text(BTN_HELP), Button.text(BTN_SUPPORT)])
+    # خانه + وضعیت
     if chat_id in ADMIN_IDS:
-        rows.append([Button.text(BTN_STATUS), Button.text(BTN_PROFILE)])
-        rows.append([Button.text(_kl(BTN_BARGH)), Button.text(BTN_SUPPORT)])
-        rows.append([Button.text(BTN_HOME)])
-    else:
-        rows.append([Button.text(BTN_PROFILE), Button.text(_kl(BTN_BARGH))])
-        rows.append([Button.text(BTN_HOME), Button.text(BTN_SUPPORT)])
-    rows.append([Button.text(_kl(BTN_ANTEN)), Button.text(_kl(BTN_SELFDES))])
-    rows.append([Button.text(_kl(BTN_YT)), Button.text(_kl(BTN_AI))])
-    rows.append([Button.text(_kl(BTN_STT)), Button.text(_kl(BTN_LINK))])
-    rows.append([Button.text(_kl(BTN_INSTA)), Button.text(_kl(BTN_DL))])
-    rows.append([Button.text(_kl(BTN_TAG)), Button.text(_kl(BTN_FINDER))])
-    rows.append([Button.text(BTN_SUB)])
-    if chat_id in ADMIN_IDS:
+        rows.append([Button.text(BTN_HOME), Button.text(BTN_STATUS)])
         rows.append([Button.text(BTN_ADMIN)])
+    else:
+        rows.append([Button.text(BTN_HOME)])
+    # ── ته کیبورد: قابلیت‌های غیرفعال ──
+    for k in range(0, len(dead), 2):
+        rows.append([Button.text(_kl(lb)) for lb in dead[k:k + 2]])
     return rows
 
 
@@ -1294,6 +1382,10 @@ async def btn_selfdes(e):
         "🔐 اطلاعات فقط برای همین کار ذخیره می‌شه و هر لحظه با /sdoff قطعش می‌کنی.",
         buttons=[[Button.inline("🔗 شروع اتصال", b"sd:start")],
                  [Button.inline("ℹ️ چطور کار می‌کنه؟", b"sd:how")]])
+    await client.send_message(
+        e.chat_id,
+        "⌨️ داخل این بخش هستی — منوی اصلی پنهان شد؛ برای برگشت: «🏠 منوی اصلی»",
+        buttons=room_kb())
 
 
 @client.on(events.CallbackQuery(pattern=r"^sd:"))
@@ -1828,6 +1920,10 @@ async def on_dl_cb(e):
             return
         flow[e.chat_id] = {"kind": "dl", "step": "phone", "ts": time.time()}
         await e.edit("📱 شماره‌ی تلگرامت را با کد کشور بفرست:\nمثال: +989123345678\n(لغو: «لغو»)")
+        await client.send_message(
+            e.chat_id,
+            "⌨️ برای خروج از این بخش: «🏠 منوی اصلی» یا «✖ خروج از بخش»",
+            buttons=room_kb())
         return
     if data == "off":
         flow.pop(e.chat_id, None)
@@ -7257,7 +7353,7 @@ async def btn_insta(e):
         "• @آیدی یا اسم → اطلاعات پروفایل\n"
         "• 🔍 سرچ <اسم> → یوزرنیم‌های اینستا پیدا می‌شود\n"
         "• #تگ → اکانت‌های مرتبط با تگ\n\n"
-        "پایان: «پایان»")
+        "پایان: «پایان»", buttons=room_kb())
 
 
 async def _insta_profile_flow(chat_id, uname, status):
@@ -9402,7 +9498,8 @@ async def on_text(e):
     if not e.is_private:
         return
     _tt = (e.text or "").strip()
-    if _tt in (BTN_HOME, BTN_COMP, BTN_PROFILE, "/home", "/exit", "/compress"):
+    if _tt in (BTN_HOME, ROOM_EXIT_BTN, BTN_COMP, BTN_PROFILE,
+               "/home", "/exit", "/compress"):
         return                    # هندلرهای اختصاصی خودشان جواب می‌دهند
     # مدیر پیام پشتیبان را فرستاد/فوروارد کرد → بازیابی خودکار
     if e.sender_id in ADMIN_IDS and "DATA|" in (e.text or "") and "🗂" in (e.text or ""):
@@ -9687,7 +9784,7 @@ async def btn_stt(e):
         "🎙 بخش ویس به متن\n\n"
         "• ویس / ویدیو-پیام / فایل صوتی بفرست → متن فارسی‌اش می‌آید\n"
         "  (ویس که مستقیم بفرستی هم خودکار جواب می‌گیری — این بخش فقط برای شروع تازه است)\n\n"
-        "پایان: «پایان»")
+        "پایان: «پایان»", buttons=room_kb())
 
 
 async def handle_stt_text(e):
@@ -9722,7 +9819,7 @@ async def btn_link(e):
         "🔗 بخش فایل به لینک\n\n"
         "• هر فایلی بفرست (عکس/ویدیو/آهنگ/زیپ/هرچی تا ۲۰۰ مگ)\n"
         "  → لینک دائمی (یا ۷۲ ساعته) می‌گیری\n\n"
-        "پایان: «پایان»")
+        "پایان: «پایان»", buttons=room_kb())
 
 
 async def handle_link_text(e):
@@ -10457,6 +10554,61 @@ def _bc_group_ids(key) -> list:
     return all_ids
 
 
+BC_PICK_PAGE = 8            # تعداد کاربر در هر صفحهٔ انتخاب دستی
+
+
+def _bc_room_targets(room) -> list:
+    """گیرنده‌های نهایی اتاق — اگر حالت «انتخاب دستی» باشد، فقط تیک‌خورده‌ها."""
+    grp = room.get("grp") or "all"
+    if grp == "custom":
+        known = {u for u, _ in _bc_targets()}
+        out, seen = [], set()
+        for u in (room.get("picks") or []):
+            try:
+                uid = int(u)
+            except Exception:
+                continue
+            if uid in known and uid not in seen:
+                seen.add(uid)
+                out.append(uid)
+        return out
+    return _bc_group_ids(grp)
+
+
+def _bc_pick_card(room, page=0):
+    """فهرست همهٔ کاربران با تیک — دکمهٔ «همه» و «هیچ» هم دارد."""
+    users = _bc_targets()
+    total = len(users)
+    pages = max((total + BC_PICK_PAGE - 1) // BC_PICK_PAGE, 1)
+    page = max(0, min(int(page), pages - 1))
+    room["pick_page"] = page
+    chunk = users[page * BC_PICK_PAGE:(page + 1) * BC_PICK_PAGE]
+    picks = {int(u) for u in (room.get("picks") or []) if str(u).lstrip("-").isdigit()}
+    lines = [f"🧑 انتخاب دستی گیرنده‌ها  •  {room.get('rid', '—')}",
+             f"✅ تیک‌خورده: {len(picks)} از {total} نفر",
+             f"📄 صفحهٔ {page + 1} از {pages}", ""]
+    if not chunk:
+        lines.append("😕 هنوز کاربری ثبت نشده.")
+    else:
+        lines.append("روی هر نام بزن تا تیک بخورد/برداشته شود:")
+    kb = []
+    for uid, name in chunk:
+        mark = "✅ " if uid in picks else "⬜ "
+        kb.append([Button.inline((mark + name)[:34], f"bcr:u:{uid}".encode())])
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("◀️ صفحهٔ قبل", f"bcr:page:{page - 1}".encode()))
+    if page < pages - 1:
+        nav.append(Button.inline("صفحهٔ بعد ▶️", f"bcr:page:{page + 1}".encode()))
+    if nav:
+        kb.append(nav)
+    kb.append([Button.inline("✅ همه", b"bcr:all"),
+               Button.inline("⬜ هیچ‌کدام", b"bcr:none")])
+    kb.append([Button.inline(f"➡️ ادامه — {len(picks)} نفر", b"bcr:pickdone")])
+    kb.append([Button.inline("🔙 بازگشت به گروه‌ها", b"bcr:grp")])
+    return "\n".join(lines), kb
+
+
 def _bc_media_name(media) -> str:
     if not media:
         return "ندارد"
@@ -10471,6 +10623,8 @@ def _bc_media_name(media) -> str:
 def _bc_room_card(room):
     """متن + دکمه‌های اتاق بر اساس مرحله‌ای که در آن است."""
     step = room.get("step", "content")
+    if step == "pick":
+        return _bc_pick_card(room, room.get("pick_page", 0))
     rid = room.get("rid", "—")
     txt = (room.get("text") or "").strip()
     media = room.get("media")
@@ -10497,13 +10651,16 @@ def _bc_room_card(room):
         for key, label in BC_GROUP_LABELS:
             kb.append([Button.inline(f"{label} — {len(_bc_group_ids(key))} نفر",
                                      f"bcr:g:{key}".encode())])
+        _np = len(room.get("picks") or [])
+        kb.append([Button.inline(f"🧑 انتخاب دستی کاربران{(' — ' + str(_np) + ' تیک') if _np else ''}",
+                                 b"bcr:pick")])
         kb.append([Button.inline("✏️ ویرایش محتوا", b"bcr:edit"),
                    Button.inline("❌ لغو", b"bcr:cancel")])
 
     elif step == "review":
         grp = room.get("grp") or "all"
-        glabel = dict(BC_GROUP_LABELS).get(grp, grp)
-        cnt = len(_bc_group_ids(grp))
+        glabel = dict(BC_GROUP_LABELS).get(grp, "🧑 انتخاب دستی")
+        cnt = len(_bc_room_targets(room))
         prev = txt.replace("\n", " ")
         body = ("مرحلهٔ ۳ از ۳ — بازبینی و تأیید\n\n"
                 f"👥 گیرنده: {glabel} — **{cnt} نفر**\n"
@@ -10688,7 +10845,7 @@ async def _bc_send(room, panel):
     from telethon.errors import FloodWaitError
     chat = panel.chat_id
     grp = room.get("grp") or "all"
-    targets = _bc_group_ids(grp)
+    targets = _bc_room_targets(room)
     text = (room.get("text") or "").strip()
     media = room.get("media")
     if media and not Path(str(media)).exists():
@@ -10908,6 +11065,63 @@ async def bc_room_cb(e):
 
     if data == "bcr:grp":
         room["step"] = "targets"
+        _bc_rooms_save()
+        await _render()
+        return
+
+    # ── 🧑 انتخاب دستی گیرنده‌ها (تیک‌زدن) ──
+    if data == "bcr:pick":
+        room["grp"] = "custom"
+        room.setdefault("picks", [])
+        room["step"] = "pick"
+        room["pick_page"] = 0
+        _bc_rooms_save()
+        await _render()
+        return
+
+    if data.startswith("bcr:page:"):
+        try:
+            room["pick_page"] = int(data.split(":")[2])
+        except Exception:
+            room["pick_page"] = 0
+        room["step"] = "pick"
+        await _render()
+        return
+
+    if data.startswith("bcr:u:"):
+        try:
+            uid = int(data.split(":", 2)[2])
+        except Exception:
+            return
+        picks = [int(u) for u in (room.get("picks") or []) if str(u).lstrip("-").isdigit()]
+        if uid in picks:
+            picks.remove(uid)
+        else:
+            picks.append(uid)
+        room["picks"] = picks
+        room["grp"] = "custom"
+        room["step"] = "pick"
+        _bc_rooms_save()
+        await _render()
+        return
+
+    if data in ("bcr:all", "bcr:none"):
+        if data == "bcr:all":
+            room["picks"] = [u for u, _ in _bc_targets()]
+        else:
+            room["picks"] = []
+        room["grp"] = "custom"
+        room["step"] = "pick"
+        _bc_rooms_save()
+        await _render()
+        return
+
+    if data == "bcr:pickdone":
+        if not _bc_room_targets(room):
+            await e.answer("اول حداقل یک نفر را تیک بزن (یا «✅ همه»).", alert=True)
+            return
+        room["grp"] = "custom"
+        room["step"] = "review"
         _bc_rooms_save()
         await _render()
         return
@@ -11364,8 +11578,7 @@ async def _open_compress(chat):
             buttons=[[Button.inline("🔑 فعال‌سازی اشتراک", b"sub:start")]])
         return False
     flow[chat] = {"kind": "compress", "ts": time.time()}
-    await client.send_message(chat, CMP_TXT,
-                              buttons=[[Button.inline("✖ خروج از بخش", b"cmp:exit")]])
+    await client.send_message(chat, CMP_TXT, buttons=room_kb())
     return True
 
 
@@ -11397,7 +11610,8 @@ async def btn_compress(e):
 
 
 @client.on(events.NewMessage(func=lambda e: e.is_private
-                             and (e.text or "").strip() in (BTN_HOME, "/home", "/exit")))
+                             and (e.text or "").strip() in (BTN_HOME, ROOM_EXIT_BTN,
+                                                            "/home", "/exit")))
 async def btn_home(e):
     try:
         await note_user(e)
