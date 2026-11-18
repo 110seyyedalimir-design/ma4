@@ -26,7 +26,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 from telethon import Button, TelegramClient, events
-from telethon.errors import SessionPasswordNeededError, FloodWaitError, PeerIdInvalid
+from telethon.errors import SessionPasswordNeededError, FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo
 
