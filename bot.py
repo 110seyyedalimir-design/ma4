@@ -34,6 +34,7 @@ from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo
 
 import bargha
 import persist
+import sessionlock as sesslock   # 🔐 رمزنگاری نشست‌ها با SESSION_KEY
 import tgstore
 # قلاب: آنتن وقتی مخزن خالی است، این را صدا می‌زند (bot تنظیم می‌کند)
 async def _anten_refresh_hook():
@@ -274,6 +275,7 @@ def _feat_of_label(t):
 
 
 ROOM_KINDS = {
+    "login":      "🔐 اتصال اکانت‌خوان",
     "compress":   "🗜 کم‌حجم کردن",
     "tag":        "🏷 تگ فایل",
     "sd":         "📸 عکس خودمحو",
@@ -306,7 +308,11 @@ async def _room_guard_early(e):
         st = globals().get("flow", {}).get(e.chat_id) or {}
         kind = st.get("kind")
         if kind not in ROOM_KINDS:
-            return
+            # مرحلهٔ لاگین اکانت‌خوان هم مثل اتاق قفل است
+            if globals().get("login_flow", {}).get(e.chat_id):
+                kind = "login"
+            else:
+                return
         txt = (getattr(e, "raw_text", None) or getattr(e, "text", "") or "").strip()
         if not txt:
             return                                    # فایل/رسانه → بخش خودش
@@ -1558,8 +1564,7 @@ async def cmd_sdoff(e):
     store = _load_sd_store()
     if str(e.chat_id) in store:
         store.pop(str(e.chat_id))
-        SD_FILE.write_text(json.dumps(store, ensure_ascii=False))
-        persist.mark_dirty()
+        _write_sd_store(store)
     await e.reply("🔌 اتصال عکسِ خودمحو قطع شد.", buttons=kb_for(e.chat_id))
 
 
@@ -2867,6 +2872,10 @@ async def handle_tag_text(e):
 async def handle_sd_login_text(e):
     st = flow.get(e.chat_id)
     t = (e.text or "").strip()
+    try:
+        st.setdefault("ids", []).append(e.message.id)   # 🛡 پاک‌سازی بعد از ورود
+    except Exception:
+        pass
     if t == "لغو":
         flow.pop(e.chat_id, None)
         await e.reply("لغو شد ✅", buttons=kb_for(e.chat_id))
@@ -2901,7 +2910,9 @@ async def handle_sd_login_text(e):
             await uc.sign_in(st["phone"], code)
         except SessionPasswordNeededError:
             st.update({"step": "pass", "ts": time.time()})
-            await e.reply("🔒 رمز دومرحله‌ای فعاله؛ پسوردت رو بفرست:")
+            await e.reply("🔒 رمز دومرحله‌ای (2FA) روی این اکانت فعال است.\n"
+                          "پسورد را بفرست — **بعد از ورود، همین پیام و کدها خودکار "
+                          "از چت پاک می‌شوند.**")
             return
         except Exception as ex:
             await e.reply(f"❌ کد درست نبود؛ دوباره بزن. ({str(ex)[:60]})",
@@ -2920,10 +2931,19 @@ async def handle_sd_login_text(e):
 
 async def _sd_finish(e, uc, st):
     flow.pop(e.chat_id, None)
+    # 🛡 پاک‌کردن شماره/کد/پسوردِ همین کاربر از چت
+    _ids = [i for i in (st.get("ids") or []) if i]
+    if _ids:
+        try:
+            await uc.delete_messages(e.chat_id, _ids, revoke=True)
+        except Exception:
+            try:
+                await client.delete_messages(e.chat_id, _ids)
+            except Exception:
+                pass
     store = _load_sd_store()
     store[str(e.chat_id)] = uc.session.save()
-    SD_FILE.write_text(json.dumps(store, ensure_ascii=False))
-    persist.mark_dirty()
+    _write_sd_store(store)
     await _start_sd_client(e.chat_id, uc)
     await e.reply(
         "✅ وصل شد! از الان عکس/ویدیوهای خودموی پیوی‌ت خودکار ذخیره می‌شن 📸\n"
@@ -8989,6 +9009,81 @@ async def cmd_perms(e):
     await e.reply(txt, buttons=kb)
 
 
+def _security_card() -> str:
+    """وضعیت امنیتی نشست‌ها — صادقانه و قابل‌بررسی."""
+    key = sesslock.key_present()
+    crypto = sesslock.crypto_available()
+    lines = ["🔐 امنیت نشست‌ها", ""]
+
+    # اکانت‌خوان
+    st = "—"
+    if SESSION_FILE.exists():
+        try:
+            raw = json.loads(SESSION_FILE.read_text())
+            st = "🔒 رمزنگاری‌شده (SESSION_KEY)" if raw.get("enc") else "⚠️ بدون رمز (متن خام)"
+        except Exception:
+            st = "⚠️ فایل خراب"
+    lines += ["👁 اکانت‌خوان:", f"   {st}",
+              f"   اتصال: {'وصل ✅' if (user_client and user_client.is_connected()) else 'قطع'}"]
+
+    # نشست‌های کاربران (عکس خودمحو)
+    sealed = plain = 0
+    try:
+        raw = json.loads(SD_FILE.read_text()) if SD_FILE.exists() else {}
+        for v in (raw or {}).values():
+            if sesslock.is_sealed(v):
+                sealed += 1
+            else:
+                plain += 1
+    except Exception:
+        pass
+    if sealed or plain:
+        lines += ["", "📸 نشست کاربران (عکس خودمحو):",
+                  f"   🔒 قفل‌شده: {sealed}   |   ⚠️ بدون قفل: {plain}"]
+
+    lines += ["", "🧩 کلید رمزنگاری (SESSION_KEY):",
+              f"   {'✅ تنظیم شده' if key else '❌ تنظیم نشده'}",
+              f"   کتابخانهٔ رمزنگاری: {'✅' if crypto else '❌ نصب نیست (cryptography)'}"]
+
+    lines += ["", "🗄 نشست‌ها کجا ذخیره می‌شوند:",
+              "   • /tmp رانر GitHub (موقت، با پایان کار پاک می‌شود)",
+              "   • مخزن دادهٔ خصوصی GitHub (data/bundle.json)",
+              "   • پیام پشتیبان تلگرام — فقط نسخهٔ قفل‌شده"]
+
+    lines += ["", "🔑 چه کسی می‌تواند وارد حساب شود؟",
+              "   هر کس رشتهٔ نشست را داشته باشد، بدون کد/رمز وارد می‌شود.",
+              "   پس فقط GH_PAT، مخزن داده و حساب تلگرامِ ادمین باید دست خودت باشد."]
+    if not key:
+        lines += ["", "⚠️ **پیشنهاد فوری:** یک Secret با نام SESSION_KEY بساز "
+                      "(متن تصادفی ≥۱۶ کاراکتر)، بعد /logout و /login کن."]
+    return "\n".join(lines)
+
+
+@client.on(events.CallbackQuery(pattern=r"^sec:"))
+async def sec_cb(e):
+    if e.sender_id not in ADMIN_IDS:
+        await e.answer("فقط مدیر.", alert=True)
+        return
+    try:
+        await e.answer()
+    except Exception:
+        pass
+    demo = "TEST-" + secrets.token_hex(8)
+    blob = sesslock.seal(demo)
+    if not blob:
+        t = ("❌ کلید SESSION_KEY تنظیم نشده — قفل‌کردن ممکن نیست.\n"
+             "در Secrets یک SESSION_KEY بساز و ربات را دوباره اجرا کن.")
+    else:
+        back, err = sesslock.open_(blob)
+        t = ("✅ قفل نشست سالم است.\n"
+             f"نمونه: {demo}\nقفل → {blob[:36]}…\nبازگشایی → {back}\n"
+             if back == demo else f"❌ تست ناموفق: {err}")
+    try:
+        await e.edit(t, buttons=[[Button.inline("🔙 بازگشت", b"a:sec")]])
+    except Exception:
+        pass
+
+
 def _admin_kb():
     return [
         [Button.inline("📣 پیام به کاربران", b"a:bc")],
@@ -9000,6 +9095,7 @@ def _admin_kb():
         [Button.inline("📡 لیست پروکسی/کانفیگ", b"a:anten")],
         [Button.inline("🖥 اکانت‌خوان (وصل/قطع)", b"a:login")],
         [Button.inline("🏛 تنظیم گروه مای‌ربات", b"a:groupinfo")],
+        [Button.inline("🔐 امنیت نشست‌ها", b"a:sec")],
         [Button.inline("🔑 توکن ربات", b"a:token")],
         [Button.inline("🔍 وضعیت فنی کامل", b"a:debug")],
         [Button.inline("🧪 تست هوش مصنوعی", b"a:aitest")],
@@ -9043,6 +9139,11 @@ async def on_admin_cb(e):
         GOLD_VIEW[chat] = ("list", 0)
         t, k = _gold_page_card(0)
         await say(t, k)
+        return
+    if data == "sec":
+        await say(_security_card(),
+                  [[Button.inline("🧪 تست قفل نشست", b"sec:test")],
+                   [Button.inline("🔙 بازگشت", b"a:menu")]])
         return
     if data == "gstats":
         await say(_golds_stats(), [[Button.inline("🔙 مدیریت طلایی", b"a:gold")]])
@@ -9260,17 +9361,46 @@ async def on_admin_cb(e):
             except Exception as ex:
                 await say(f"❌ {str(ex)[:100]}")
     elif data == "login":
-        if user_client and user_client.is_connected():
-            try:
+        _uc = globals().get("user_client")
+        _conn = bool(_uc and _uc.is_connected())
+        _enc = False
+        try:
+            _enc = bool(json.loads(SESSION_FILE.read_text()).get("enc"))
+        except Exception:
+            pass
+        _st = ("وصل ✅" if _conn else "قطع") + ("  |  قفل نشست: " + ("🔒 بله" if _enc else "⚠️ خیر"))
+        await say(
+            f"🖥 اکانت‌خوان\n\nوضعیت: {_st}\n\n"
+            "🔐 رمز دومرحله‌ای (2FA) اگر روی اکانت باشد، بعد از کد، پسورد را "
+            "همین‌جا می‌پرسد — پیام پسورد بلافاصله از چت پاک می‌شود.",
+            [[Button.inline("🔗 اتصال / لاگین", b"a:login2")] if not _conn
+             else Button.inline("🔌 قطع اتصال و پاک‌کردن نشست", b"a:logout2")],
+            [[Button.inline("🔐 امنیت نشست‌ها", b"a:sec")],
+             [Button.inline("🔙 بازگشت", b"a:menu")]])
+        return
+    elif data == "login2":
+        login_flow[chat] = {"step": "phone", "ts": time.time()}
+        await client.send_message(
+            chat,
+            "🔐 اتصال اکانت‌خوان\n\n"
+            "۱) شماره‌ات را با کد کشور بفرست (مثل +98912345678)\n"
+            "۲) کد تلگرام را با کیبورد عددی بزن\n"
+            "۳) اگر ۲FA داری، پسورد را بفرست\n\n"
+            "🛡 شماره/کد/پسورد بعد از استفاده از چت پاک می‌شوند.\n"
+            "برای انصراف: «✖ خروج از بخش» یا /cancel",
+            buttons=room_kb())
+        return
+    elif data == "logout2":
+        try:
+            if globals().get("user_client"):
                 await user_client.disconnect()
-            except Exception:
-                pass
-            SESSION_FILE.unlink(missing_ok=True)
-            globals()["user_client"] = None
-            await say("🔌 اکانت‌خوان قطع شد.")
-        else:
-            login_flow[chat] = {"step": "phone"}
-            await client.send_message(chat, "🔐 شماره‌ی اکانت‌خوان را با +98 بفرست:")
+        except Exception:
+            pass
+        globals()["user_client"] = None
+        SESSION_FILE.unlink(missing_ok=True)
+        persist.mark_dirty()
+        await say("🔌 اکانت‌خوان قطع و نشستش پاک شد.",
+                  [[Button.inline("🔙 بازگشت", b"a:menu")]])
     elif data == "groupinfo":
         await say(
             "🏛 گروه مای‌ربات:\n"
@@ -12436,7 +12566,10 @@ async def cmd_login(e):
     login_flow[e.chat_id] = {"step": "phone", "ts": time.time()}
     await e.reply("🔐 اتصال اکانت‌خوان (فقط-خواندن)\n\n"
                   "شماره موبایل اکانت تلگرامت رو با کد کشور بفرست:\n"
-                  "مثال: +989123345678")
+                  "مثال: +989123345678\n\n"
+                  "🛡 شماره/کد/پسورد بعد از استفاده از چت پاک می‌شوند.\n"
+                  "انصراف: «✖ خروج از بخش» یا /cancel",
+                  buttons=room_kb())
 
 
 @client.on(events.NewMessage(pattern=r"^/logout$"))
@@ -12460,6 +12593,11 @@ async def handle_login_text(e):
     if not st:
         return
     t = (e.text or "").strip()
+    # 🛡 پیام‌های حساس (شماره/کد/پسورد) برای پاک‌سازی خودکار ثبت می‌شوند
+    try:
+        st.setdefault("ids", []).append(e.message.id)
+    except Exception:
+        pass
     if t == "لغو":
         login_flow.pop(e.chat_id, None)
         await e.reply("لغو شد ✅")
@@ -12499,7 +12637,9 @@ async def handle_login_text(e):
             await uc.sign_in(st["phone"], code)
         except SessionPasswordNeededError:
             st.update({"step": "pass", "ts": time.time()})
-            await e.reply("🔒 رمز دومرحله‌ای فعاله؛ پسوردت رو بفرست:")
+            await e.reply("🔒 رمز دومرحله‌ای (2FA) روی این اکانت فعال است.\n"
+                          "پسورد را بفرست — **بعد از ورود، همین پیام و کدها خودکار "
+                          "از چت پاک می‌شوند.**")
             return
         except Exception as ex:
             await e.reply(f"❌ کد درست نبود ({str(ex)[:80]}); دوباره بفرست.")
@@ -12519,9 +12659,30 @@ async def _finish_login(e, uc, st):
     global user_client
     login_flow.pop(e.chat_id, None)
     session_str = uc.session.save()
-    SESSION_FILE.write_text(json.dumps({"session": session_str}), encoding="utf-8")
+    _sealed = sesslock.seal(session_str)
+    if _sealed:
+        SESSION_FILE.write_text(json.dumps({"enc": _sealed}), encoding="utf-8")
+    else:
+        SESSION_FILE.write_text(json.dumps({"session": session_str}), encoding="utf-8")
+        try:
+            await e.reply("⚠️ **هشدار امنیتی:** کلید `SESSION_KEY` تنظیم نشده، "
+                          "پس نشست اکانت‌خوان رمزنگاری نشده ذخیره شد.\n"
+                          "برای امن‌شدن: در Secrets یک `SESSION_KEY` (متن تصادفی طولانی) بساز، "
+                          "بعد یک‌بار /logout و دوباره /login کن.")
+        except Exception:
+            pass
     tgstore.mark_dirty()
     user_client = uc
+    # 🛡 پاک‌کردن پیام‌های شماره/کد/پسورد از چت (با خودِ اکانتِ تازه‌واردشده)
+    _ids = [i for i in (st.get("ids") or []) if i]
+    if _ids:
+        try:
+            await uc.delete_messages(e.chat_id, _ids, revoke=True)
+        except Exception:
+            try:
+                await client.delete_messages(e.chat_id, _ids)
+            except Exception:
+                pass
     await _start_user_watcher(uc)
     try:
         _setup_finder_handler()
@@ -12701,18 +12862,40 @@ sd_clients = {}   # chat_id(int) → TelegramClient
 
 
 def _load_sd_store() -> dict:
+    """خواندن نشست‌های کاربران — اگر قفل باشند باز می‌شوند (کلید: SESSION_KEY)."""
     try:
-        return json.loads(SD_FILE.read_text())
+        raw = json.loads(SD_FILE.read_text())
     except Exception:
         return {}
+    out, bad = {}, 0
+    for k, v in (raw or {}).items():
+        if sesslock.is_sealed(v):
+            plain, _e = sesslock.open_(v)
+            if plain:
+                out[k] = plain
+            else:
+                bad += 1
+        else:
+            out[k] = v
+    if bad:
+        log.warning("sd: %d نشست قفل‌شده باز نشد (SESSION_KEY؟)", bad)
+    return out
 
 
-def _save_sd_store():
+def _write_sd_store(store: dict):
+    """ذخیرهٔ نشست‌ها — رمزشده اگر SESSION_KEY باشد."""
+    out = {}
+    for k, v in (store or {}).items():
+        out[k] = sesslock.seal(v) or v
     try:
-        SD_FILE.write_text(json.dumps(_load_sd_store(), ensure_ascii=False))
+        SD_FILE.write_text(json.dumps(out, ensure_ascii=False))
     except OSError:
         pass
     persist.mark_dirty()
+
+
+def _save_sd_store():
+    _write_sd_store(_load_sd_store())
 
 
 def _mk_sd_media_handler(owner_id, uc):
@@ -12809,7 +12992,7 @@ async def _restore_sd_sessions():
                 await _start_sd_client(int(k), uc)
             else:
                 store.pop(k)
-                SD_FILE.write_text(json.dumps(store, ensure_ascii=False))
+                _write_sd_store(store)
         except Exception:
             continue
     if sd_clients:
@@ -13306,7 +13489,21 @@ async def _restore_user_client():
     try:
         if not SESSION_FILE.exists():
             return
-        s = json.loads(SESSION_FILE.read_text()).get("session")
+        _raw = json.loads(SESSION_FILE.read_text())
+        s = _raw.get("session")
+        if not s and _raw.get("enc"):
+            s, _err = sesslock.open_(_raw.get("enc"))
+            if not s:
+                log.warning("userbot: نشست قفل است و باز نشد (%s) — SESSION_KEY را بررسی کن", _err)
+                try:
+                    await client.send_message(
+                        int(next(iter(ADMIN_IDS))),
+                        f"🔐 نشست اکانت‌خوان رمزنگاری‌شده است ولی باز نشد:\n{_err}\n\n"
+                        "یعنی `SESSION_KEY` عوض/پاک شده. یا همان کلید قبلی را برگردان، "
+                        "یا /login کن تا نشست تازه با کلید فعلی ذخیره شود.")
+                except Exception:
+                    pass
+                return
         if not s:
             return
         uc = TelegramClient(StringSession(s), API_ID, API_HASH)

@@ -105,6 +105,30 @@ def mark_dirty():
     _state["dirty"] = True
 
 
+SECRET_FILES = {"user_session.json", "sd_sessions.json"}   # نشست‌های حساس
+
+
+def _only_sealed(name: str, payload):
+    """در بکاپِ تلگرامی، از نشست‌ها فقط نسخهٔ رمزنگاری‌شده می‌رود.
+    (متن خامِ نشست = ورود کامل به حساب؛ هرگز در پیام تلگرام نمی‌گذاریم)"""
+    if payload is None:
+        return None
+    def _sealed(v):
+        return isinstance(v, str) and v.strip().startswith("sl1:")
+    if name == "user_session.json":
+        if isinstance(payload, dict) and _sealed(payload.get("enc")):
+            return {"enc": payload["enc"]}
+        return {"_note": "🔒 نشست رمزنگاری نشده — برای امنیت در بکاپ تلگرام نیامد "
+                         "(SESSION_KEY بساز تا اینجا هم بیاید)"}
+    if name == "sd_sessions.json":
+        if isinstance(payload, dict):
+            keep = {k: v for k, v in payload.items() if _sealed(v)}
+            if len(keep) != len(payload):
+                keep["_note"] = f"🔒 {len(payload) - len(keep)} نشستِ بدون قفل حذف شد"
+            return keep
+    return payload
+
+
 def _snapshot() -> str:
     data = {}
     for f in FILES:
@@ -113,6 +137,8 @@ def _snapshot() -> str:
             data[f] = json.loads(p.read_text()) if p.exists() else None
         except Exception:
             data[f] = None
+        if f in SECRET_FILES:
+            data[f] = _only_sealed(f, data[f])
     # محافظ طول پیام تلگرام (۴۰۹۶): اول کاربرها سبک می‌شوند
     s = json.dumps(data, ensure_ascii=False)
     if len(s) > 3800 and data.get("comp_users.json"):
