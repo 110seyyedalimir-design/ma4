@@ -314,6 +314,7 @@ ROOM_KINDS = {
     "link":       "🔗 فایل به لینک",
     "insta":      "📸 اینستاگرام",
     "goldsearch": "🔍 جستجوی کاربر",
+    "pm":         "✉️ پیام به یک کاربر",
 }
 ROOM_EXIT_BTN = "✖ خروج از بخش"
 # دکمه‌های منوی اصلی که داخل اتاق نباید کار کنند
@@ -486,6 +487,45 @@ async def _bc_room_early(e):
 client.add_event_handler(_room_guard_early, events.NewMessage())   # اتاق ایزوله: منو پاسخ ندهد
 client.add_event_handler(_locked_feat_early, events.NewMessage())  # قابلیت خاموش → یک پیام
 client.add_event_handler(_bc_room_early, events.NewMessage())   # اتاق پیام‌رسانی: قبل از همهٔ بخش‌ها
+
+
+async def _file_job_guard(e):
+    """🔒 هر کاربر در هر لحظه فقط یک فایل در دستِ پردازش دارد."""
+    try:
+        if getattr(e, "out", False) or not getattr(e, "is_private", False):
+            return
+        msg = getattr(e, "message", None)
+        if msg is None or not (getattr(msg, "file", None) or getattr(msg, "photo", None)):
+            return
+        chat = e.chat_id
+        # مدیر داخل اتاق پیام‌رسانی/پیام تکی: آزاد (محتوای ارسال است، نه فایل کاربر)
+        if e.sender_id in ADMIN_IDS and ((BC_ROOMS or {}).get(chat)
+                                         or (flow.get(chat) or {}).get("kind") == "pm"):
+            return
+        j = _file_job_active(chat)
+        if not j:
+            return
+        # فایل قبلی فقط «منتظر انتخاب کیفیت» است و کاری شروع نشده → فایل جدید جایش می‌نشیند
+        _pd = pending.get(str(chat)) or {}
+        if _pd.get("src") is None and not busy.get(chat) and not COMPRESS_JOBS.get(chat):
+            _file_job_end(chat)
+            return
+        left = int(max(0, float(j.get("until") or 0) - time.time()))
+        await e.reply(
+            f"⏳ **الان یک فایل از تو در حال پردازش است** («{j.get('label') or 'فایل'}»).\n\n"
+            "تا آن یکی تمام نشود، فایل بعدی را قبول نمی‌کنم — "
+            "این‌طوری هر دو فایل سالم و کامل پردازش می‌شوند.\n\n"
+            f"⏱ حداکثر تا ~{max(1, left // 60)} دقیقهٔ دیگر آزاد می‌شود.\n"
+            "اگر گیر کرده، با دکمهٔ زیر آزادش کن:",
+            buttons=[[Button.inline("✖ لغو و آزادسازی", b"job:reset")]])
+        raise events.StopPropagation
+    except events.StopPropagation:
+        raise
+    except Exception:
+        pass
+
+
+client.add_event_handler(_file_job_guard, events.NewMessage())
 PROCESS_START = time.time()
 
 
@@ -605,6 +645,35 @@ HELP_TEXT = (
 pending = {}
 busy = {}
 jobs = {}
+
+# ── 🔒 یک فایل در هر زمان برای هر کاربر (بخش‌های فایل: کم‌حجم، تگ، لینک، دانلود…) ──
+FILE_JOB = {}            # chat_id → {"label": str, "ts": float, "until": float}
+FILE_JOB_TTL = 25 * 60   # سقف انتظار برای کارهای سنگین (فشرده‌سازی/دانلود بزرگ)
+FILE_JOB_TTL_FAST = 3 * 60  # برای بخش‌های سریع (تگ/لینک/ویس)
+
+FILE_SECTIONS = {"compress", "tag", "link", "dl", "stt"}
+
+
+def _file_job_active(chat_id):
+    j = FILE_JOB.get(chat_id)
+    if not j:
+        return None
+    if time.time() > float(j.get("until") or 0):
+        FILE_JOB.pop(chat_id, None)      # منقضی شد → آزاد
+        return None
+    return j
+
+
+def _file_job_begin(chat_id, label="فایل", ttl=None):
+    kind = (globals().get("flow", {}).get(chat_id) or {}).get("kind")
+    if ttl is None:
+        ttl = FILE_JOB_TTL if kind in (None, "compress") else FILE_JOB_TTL_FAST
+    FILE_JOB[chat_id] = {"label": str(label)[:40], "ts": time.time(),
+                         "until": time.time() + ttl}
+
+
+def _file_job_end(chat_id):
+    FILE_JOB.pop(chat_id, None)
 history = deque(maxlen=100)
 users_seen = {}          # str(id) → {name, uname, seen, jobs}
 DL_DLG = {}              # chat_id → {pairs, group, ts} نتیجهٔ جستجوی کانال/گروه
@@ -860,6 +929,16 @@ def _ffmpeg_progress(cmd, prog=None, weight=(0.0, 1.0), duration=None, job=None)
 def compress_video(src: Path, dst: Path, mode: str, info: dict, prog: dict, job=None) -> Path:
     dur = max(info.get("duration") or 1, 1)
     src_mb = src.stat().st_size / 1024 / 1024
+    # 🔒 سقفِ بیت‌ریت: خروجی هرگز از ۹۰٪ حجم اصلی بزرگ‌تر نشود
+    src_kbps = int(src.stat().st_size * 8 / dur / 1000) if dur else 0
+    cap_kbps = int(src_kbps * 0.90) if src_kbps else 0
+
+    def _cap(extra_audio=64):
+        """آرگومان‌های سقف بیت‌ریت برای حالت‌های CRF (اگر معنی داشته باشد)."""
+        v_cap = cap_kbps - extra_audio
+        if v_cap < 120:
+            return []
+        return ["-maxrate", f"{v_cap}k", "-bufsize", f"{v_cap * 2}k"]
     # 🔧 سرعت محور: veryfast/superfast روی رانر چند برابر سریع‌تر از medium است؛ افت کیفیت در این کاربری ناچیز
     preset = "veryfast" if dur <= 45 * 60 else "superfast"
 
@@ -890,20 +969,20 @@ def compress_video(src: Path, dst: Path, mode: str, info: dict, prog: dict, job=
 
     if mode == "turbo":
         # ⚡ سریع‌ترین حالت ممکن: ultrafast + CRF بالا + ۴۸۰p + صدای سبک (تک‌گذره)
-        vcodec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30"]
+        vcodec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", *_cap(64)]
         vf = ["-vf", "scale=-2:min(480\\,ih)"]
         cmd = _video_cmd(src, dst, vcodec, vf, 64)
         _ffmpeg_progress(cmd, prog, (0.0, 1.0), dur, job)
         return dst
 
     if mode == "quality":
-        vcodec = ["-c:v", "libx264", "-preset", preset, "-crf", "23"]
+        vcodec = ["-c:v", "libx264", "-preset", preset, "-crf", "23", *_cap(128)]
         vf = ["-vf", "scale=-2:min(1080\\,ih)"]
         cmd = _video_cmd(src, dst, vcodec, vf, 128)
         _ffmpeg_progress(cmd, prog, (0.0, 1.0), dur, job)
         return dst
 
-    vcodec = ["-c:v", "libx264", "-crf", "30", "-preset", "veryfast"]
+    vcodec = ["-c:v", "libx264", "-crf", "30", "-preset", "veryfast", *_cap(96)]
     vf = ["-vf", "scale=-2:min(480\\,ih)"]
     cmd = _video_cmd(src, dst, vcodec, vf, 96)
     _ffmpeg_progress(cmd, prog, (0.0, 1.0), dur, job)
@@ -1118,9 +1197,17 @@ async def btn_anten(e):
 
 @client.on(events.CallbackQuery(pattern=r"^x:"))
 async def on_cancel_cb(e):
+    _file_job_end(e.chat_id)
+    pending.pop(str(e.chat_id), None)
+    save_pending()
     cjob = COMPRESS_JOBS.get(e.chat_id)
     if not cjob:
-        await e.answer("کاری در جریان نیست", alert=True)
+        busy[e.chat_id] = False
+        try:
+            await e.edit("✖ لغو شد — فایل جدیدت را بفرست 📎", buttons=None)
+        except Exception:
+            pass
+        await e.answer("لغو شد")
         return
     cjob["cancel"] = True
     p = cjob.get("proc")
@@ -1132,13 +1219,43 @@ async def on_cancel_cb(e):
     await e.answer("در حال لغو…")
 
 
+@client.on(events.CallbackQuery(pattern=r"^job:"))
+async def job_reset_cb(e):
+    """آزادسازی دستیِ قفلِ فایل (اگر کاری گیر کرده باشد)."""
+    chat = e.chat_id
+    cjob = COMPRESS_JOBS.get(chat)
+    if cjob:
+        cjob["cancel"] = True
+        p_ = cjob.get("proc")
+        if p_:
+            try:
+                p_.kill()
+            except Exception:
+                pass
+    _file_job_end(chat)
+    busy[chat] = False
+    pending.pop(str(chat), None)
+    save_pending()
+    try:
+        await e.answer("آزاد شد ✅", alert=True)
+    except Exception:
+        pass
+    try:
+        await e.edit("✅ آزاد شد. حالا فایل جدیدت را بفرست 📎", buttons=None)
+    except Exception:
+        pass
+
+
 @client.on(events.NewMessage(pattern=r"^/cancel$"))
 async def cmd_cancel(e):
     if not e.is_private:
         return
+    _file_job_end(e.chat_id)
     cjob = COMPRESS_JOBS.get(e.chat_id)
     if not cjob:
-        await e.reply("کاری در جریان نیست 🙂")
+        pending.pop(str(e.chat_id), None)
+        save_pending()
+        await e.reply("کاری در جریان نیست 🙂 (هر قفلی هم آزاد شد)")
         return
     cjob["cancel"] = True
     p = cjob.get("proc")
@@ -2685,6 +2802,7 @@ async def _tag_run(chat_id, m, new_name, thumb_msg=None):
             pass
         return
     TAG_BUSY[chat_id] = True
+    _file_job_begin(chat_id, (m.file.name if m.file else "فایل"), ttl=FILE_JOB_TTL)
     status = None
     tmpdir = None
     try:
@@ -2832,6 +2950,7 @@ async def _tag_run(chat_id, m, new_name, thumb_msg=None):
             pass
     finally:
         TAG_BUSY.pop(chat_id, None)
+        _file_job_end(chat_id)
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -9116,6 +9235,7 @@ async def sec_cb(e):
 
 def _admin_kb():
     return [
+        [Button.inline("✉️ پیام به یک کاربر", b"pm:open")],
         [Button.inline("📣 پیام به کاربران", b"a:bc")],
         [Button.inline("🔑 اشتراک‌ها و مجوزها", b"a:sub")],
         [Button.inline("💬 صندوق پشتیبانی", b"a:support")],
@@ -10089,6 +10209,7 @@ async def on_file(e):
     # ─── بخش «🔗 فایل به لینک» فعال است؟ این فایل → لینک ───
     _f_active = flow.get(chat_id) or {}
     if _f_active.get("kind") == "link" and TOOLS_OK:
+        _file_job_begin(chat_id, f.name or "فایل", ttl=FILE_JOB_TTL)
         try:
             if size > ACCEPT_MAX:
                 await e.reply(f"⚠️ سقف عملی {CAP_TEXT} است؛ تلگرام بالاتر از ~۲ گیگ را منتقل نمی‌کند.")
@@ -10107,10 +10228,13 @@ async def on_file(e):
                 link_preview=False)
         except Exception as ex:
             await e.reply(f"❌ {str(ex)[:150]}")
+        finally:
+            _file_job_end(chat_id)
         return
 
     # ─── بخش «🎙 ویس به متن» فعال است؟ هر صوت/ویدیویی → متن ───
     if _f_active.get("kind") == "stt" and AI_OK:
+        _file_job_begin(chat_id, f.name or "صدا", ttl=FILE_JOB_TTL_FAST)
         try:
             if e.message.voice or getattr(e.message, "video_note", None) or e.message.audio \
                     or (f.name or "").lower().endswith((".mp3",".m4a",".ogg",".wav",".opus",".flac",".mp4",".mkv",".webm")):
@@ -10123,6 +10247,8 @@ async def on_file(e):
                 await e.reply("🎙 این فایل صوتی/ویدیویی نیست — فایل صوتی بفرست یا «پایان»")
         except Exception:
             pass
+        finally:
+            _file_job_end(chat_id)
         return
 
     # 🎙 ویس هر کاربری → متن فارسی خودکار (Whisper)
@@ -10254,117 +10380,283 @@ async def on_file(e):
         return
 
     await asyncio.to_thread(cleanup_old)
-    status = await e.reply("⏳ در حال دریافت فایل…")
 
+    # ── ۱) نوع فایل را از خودِ پیام تشخیص بده (بدون دانلود) ──
+    mime = (f.mime_type or "").lower()
+    name = f.name or ("photo.jpg" if e.message.photo else "file")
+    ext = pathlib.Path(name).suffix.lower()
+    _VID_EXT = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts", ".flv",
+                ".wmv", ".mpg", ".mpeg", ".3gp", ".m2ts", ".vob"}
+    _AUD_EXT = {".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac", ".wma"}
+    if e.message.photo or mime.startswith("image/"):
+        kind = KIND_IMAGE
+    elif (e.message.video or getattr(e.message, "video_note", None) is not None
+          or mime.startswith("video/") or ext in _VID_EXT):
+        kind = KIND_VIDEO
+    elif (e.message.audio or e.message.voice or mime.startswith("audio/")
+          or ext in _AUD_EXT):
+        kind = KIND_AUDIO
+    else:
+        await e.reply("🤔 این نوع فایل رو نمی‌تونم فشرده کنم.\n"
+                      "پشتیبانی‌شده‌ها: ویدیو 🎬 عکس 🖼 فایل صوتی 🎵")
+        return
+
+    # ── ۲) قبل از هیچ دانلودی، بپرس چقدر کم‌حجم شود ──
+    pending[str(chat_id)] = {"msg_id": e.message.id, "chat": chat_id, "src": None,
+                             "size": size, "kind": kind, "info": None, "name": name,
+                             "ts": time.time()}
+    save_pending()
+    jobs[str(chat_id)] = {"name": name, "size": size, "kind": kind,
+                          "status": "در انتظار انتخاب کاربر"}
+    _file_job_begin(chat_id, name, ttl=FILE_JOB_TTL)
+    _dur, _w, _h, _fps = _media_meta(e.message)
+    rows, note = _mode_rows(kind, size, _dur, _w, _h, _fps)
+    if not rows:
+        await e.reply(
+            f"✅ این فایل از قبل فشرده است ({fmt_size(size)}) — هر حالتی حجمش را "
+            "کم نمی‌کند، پس دست به آن نمی‌زنم.\n"
+            "اگر بخواهی، می‌توانی «🎵 فقط صدا» را از حالت‌های دیگر امتحان کنی.",
+            buttons=[[Button.inline("🎵 فقط صدا", b"v:audio")],
+                     [Button.inline("✖ لغو", b"x:cancel")]])
+        return
+    _meta_txt = ""
+    if _dur:
+        _meta_txt = f"⏱ {_dur // 60}:{_dur % 60:02d}"
+        if _w and _h:
+            _meta_txt += f"  📐 {_w}×{_h}"
+        _kbps = int(size * 8 / _dur / 1000)
+        _meta_txt += f"  📶 ~{_kbps}kbps"
+    await e.reply(
+        f"📄 فایل رسید: **{name[:45]}**\n"
+        f"📦 حجم فعلی: **{fmt_size(size)}**" + (f"\n{_meta_txt}" if _meta_txt else "") + "\n\n"
+        "⚡ **چقدر کم‌حجمش کنم؟** 👇 (برآورد حجم نهایی روی هر دکمه نوشته شده)\n"
+        "بعد از انتخاب، دانلود شروع می‌شود — تا آن لحظه هیچ ترافیکی مصرف نمی‌شود."
+        + note,
+        buttons=rows)
+
+
+
+def _media_meta(msg):
+    """مدت/ابعاد/نرخ فریم را از خودِ پیام می‌خواند (بدون دانلود)."""
+    dur, w, h, fps = 0, 0, 0, 25.0
     try:
-        st = {"cur": 0, "total": size, "t0": time.time()}
+        dur = int(getattr(msg, "duration", 0) or 0)
+    except Exception:
+        dur = 0
+    try:
+        from telethon.tl.types import DocumentAttributeVideo
+        for at in (getattr(getattr(msg, "document", None), "attributes", []) or []):
+            if isinstance(at, DocumentAttributeVideo):
+                w = int(getattr(at, "w", 0) or 0)
+                h = int(getattr(at, "h", 0) or 0)
+                dur = dur or int(getattr(at, "duration", 0) or 0)
+                fps = float(getattr(at, "fps", 0) or 25.0) or 25.0
+    except Exception:
+        pass
+    return dur, w, h, fps
 
-        async def dl():
-            if USE_BIG:
-                return await _big_ingest_download(e.message, st)
-            return await e.message.download_media(
-                file=str(WORKDIR),
-                progress_callback=lambda c, t: st.update(cur=c, total=t),
-            )
 
-        task = asyncio.create_task(dl())
-        last_cur, last_move = 0, time.time()
+# ضریب تقریبی بیت‌بر-پیکسل برای هر حالت CRF (بر مبنای آزمون‌های عملی x264)
+_EST_BPP = {"turbo": 0.075, "480": 0.075, "quality": 0.105}
+
+
+def _est_out(size, dur, kind, mode, w=0, h=0, fps=25.0):
+    """برآورد حجم خروجی (بایت) — None یعنی قابل حدس نیست."""
+    try:
+        if kind == KIND_VIDEO:
+            if mode in ("half", "quarter", "hevc"):
+                frac = 0.5 if mode in ("half", "hevc") else 0.25
+                eff = 0.95 if mode == "hevc" else 0.93
+                return int(size * frac * eff)
+            if mode == "audio":
+                return int(96_000 / 8 * dur) if dur else None
+            cap_h = {"turbo": 480, "480": 480, "quality": 1080}.get(mode)
+            if not cap_h or not dur:
+                return None
+            oh = min(h, cap_h) if h else cap_h
+            px = oh * oh * 16 / 9
+            v = px * (fps or 25.0) * _EST_BPP.get(mode, 0.08) / 1000      # kbps
+            a = 64 if mode == "turbo" else (128 if mode == "quality" else 96)
+            return int((v + a) * 1000 * dur / 8)
+        if kind == KIND_AUDIO:
+            return int(96_000 / 8 * dur) if dur else None
+        if kind == KIND_IMAGE:
+            return int(size * (0.35 if mode == "strong" else 0.55))
+    except Exception:
+        return None
+    return None
+
+
+def _fmt_est(b):
+    if not b:
+        return "?"
+    if b >= 1024 ** 3:
+        return f"≈{b / 1024 ** 3:.2f}GB"
+    return f"≈{max(1, round(b / 1024 ** 2))}MB"
+
+
+def _mode_rows(kind, size=0, dur=0, w=0, h=0, fps=25.0):
+    """دکمه‌های «چقدر کم‌حجم کنم؟» + برآورد حجم روی هر دکمه.
+    حالت‌هایی که حجم را بزرگ‌تر می‌کنند اصلاً نشان داده نمی‌شوند.
+    خروجی: (rows, note)"""
+    rows, grown, ests = [], [], []
+    if kind == KIND_VIDEO:
+        spec = [("turbo", "⚡ توربو (سریع)"),
+                ("half", "🎯 نصف حجم"),
+                ("quarter", "📦 یک‌چهارم"),
+                ("quality", "✨ کمترین افت"),
+                ("hevc", "🔬 HEVC نصف"),
+                ("480", "🎬 480p سبک"),
+                ("audio", "🎵 فقط صدا")]
+    elif kind == KIND_IMAGE:
+        spec = [("soft", "🖼 کم‌حجم"), ("strong", "🖼 خیلی کم‌حجم")]
+    else:
+        spec = [("96", "🎵 کم‌حجم (96kbps)")]
+
+    for mode, label in spec:
+        est = _est_out(size, dur, kind, mode, w, h, fps)
+        if size and est is not None and est >= size * 0.95:
+            grown.append(label)
+            continue
+        cb = _cb_prefix(kind, mode).encode()
+        txt = f"{label} → {_fmt_est(est)}" if est else label
+        rows.append([Button.inline(txt, cb)])
+        if est:
+            ests.append(est)
+
+    note = ""
+    if grown:
+        note = ("\n\n⛔️ این حالت‌ها حجم را **بزرگ‌تر** می‌کردند، پس نمایش داده نشدند: "
+                + "، ".join(grown))
+    rows.append([Button.inline("✖ لغو", b"x:cancel")])
+    if not ests and grown:
+        return [], note
+    return rows, note
+
+
+def _cb_prefix(kind, mode):
+    if kind == KIND_VIDEO:
+        return f"v:{mode}"
+    if kind == KIND_IMAGE:
+        return f"i:{mode}"
+    return f"a:{mode}"
+
+
+async def _pending_download(e, chat_id, req):
+    """دانلودِ فایلِ در انتظار — *بعد از* انتخاب «چقدر کم‌حجم کنم».
+    پیشرفت زنده + لغوِ واقعی (کنسل کردن تسک/کشتن ffmpeg). خروجی True/False."""
+    try:
+        msg = await client.get_messages(int(req.get("chat") or chat_id),
+                                       ids=int(req.get("msg_id") or 0))
+    except Exception:
+        msg = None
+    if not msg or not getattr(msg, "media", None):
+        pending.pop(str(chat_id), None)
+        save_pending()
+        try:
+            await e.edit("⌛ فایل پیدا نشد (شاید پیام پاک شده) — دوباره بفرست.")
+        except Exception:
+            pass
+        return False
+
+    size = int(req.get("size") or 0)
+    uc = globals().get("user_client")
+    _uc_ok = bool(uc and uc.is_connected())
+    _grp_ok = bool((((GROUP_CFG or {}).get("media") or {}).get("chat")))
+    use_big = size > ACCEPT_MAX or (size > BOT_DL_MAX and _uc_ok and _grp_ok)
+
+    st = {"cur": 0, "total": size, "t0": time.time()}
+    cjob = {"proc": None, "cancel": False}
+    COMPRESS_JOBS[chat_id] = cjob
+    try:
+        jobs[str(chat_id)]["status"] = "در حال دریافت"
+    except Exception:
+        pass
+
+    async def dl():
+        if use_big:
+            return await _big_ingest_download(msg, st)
+        return await msg.download_media(
+            file=str(WORKDIR),
+            progress_callback=lambda c, t: st.update(cur=c, total=t))
+
+    task = asyncio.create_task(dl())
+    last_cur, last_move = 0, time.time()
+    try:
         while not task.done():
-            await asyncio.sleep(4)
-            cur, total = st["cur"], st["total"]
-            if cur != last_cur:
-                last_cur, last_move = cur, time.time()
-            elif time.time() - last_move > STALL_RECV_S:
+            await asyncio.sleep(3)
+            if cjob.get("cancel"):
                 task.cancel()
                 try:
                     await task
                 except Exception:
                     pass
+                pending.pop(str(chat_id), None)
+                save_pending()
+                try:
+                    await e.edit("✖ لغو شد — هیچ فایلی دانلود/پردازش نشد. "
+                                 "همین حالا می‌تونی فایل جدید بفرستی 📎")
+                except Exception:
+                    pass
+                return False
+            cur, total = st["cur"], st["total"]
+            if cur != last_cur:
+                last_cur, last_move = cur, time.time()
+            elif time.time() - last_move > STALL_RECV_S:
+                task.cancel()
                 raise RuntimeError(f"دریافت بیش از {STALL_RECV_S // 60} دقیقه بدون پیشرفت ماند — "
-                                 "اتصال تلگرام قطع/خیلی کند است؛ دوباره بفرست.")
+                                   "اتصال تلگرام قطع/کند است؛ دوباره بفرست.")
             if total:
                 el = time.time() - st["t0"]
                 spd = cur / max(el, 1)
-                eta = (total - cur) / max(spd, 1)
                 try:
-                    await status.edit(
+                    await e.edit(
                         f"⏳ در حال دریافت فایل… {int(cur * 100 / total)}%\n"
                         f"📊 {fmt_size(cur)} از {fmt_size(total)}  "
-                        f"⚡ {fmt_size(spd)}/s  ⏱ {fmt_eta(eta)}"
-                    )
+                        f"⚡ {fmt_size(spd)}/s  ⏱ {fmt_eta((total - cur) / max(spd, 1))}",
+                        buttons=[[Button.inline("✖ لغو", b"x:cancel")]])
                 except Exception:
                     pass
-        src = Path(task.result())
+        path = Path(task.result())
     except Exception as ex:
-        log.exception("download failed")
-        await status.edit(f"❌ دریافت فایل ناموفق بود: {str(ex)[:150]}")
-        return
+        log.exception("pending download failed")
+        pending.pop(str(chat_id), None)
+        save_pending()
+        try:
+            await e.edit(f"❌ دریافت فایل ناموفق بود: {str(ex)[:150]}")
+        except Exception:
+            pass
+        return False
 
+    # ── بررسی فایل و آماده‌سازی ──
     try:
-        info = ffprobe(src)
+        info = ffprobe(path)
     except Exception:
-        src.unlink(missing_ok=True)
-        await status.edit("❌ نتونستم این فایل رو بخونم (فرمت پشتیبانی نمی‌شه).")
-        return
+        path.unlink(missing_ok=True)
+        pending.pop(str(chat_id), None)
+        save_pending()
+        try:
+            await e.edit("❌ نتونستم این فایل رو بخونم (فرمت پشتیبانی نمی‌شود).")
+        except Exception:
+            pass
+        return False
+    mime = ((getattr(msg, "file", None) and (msg.file.mime_type or "")) or "").lower()
+    if (info.get("video") or mime.startswith("audio/")) and not FFMPEG_OK:
+        path.unlink(missing_ok=True)
+        pending.pop(str(chat_id), None)
+        save_pending()
+        try:
+            await e.edit("⚠️ ابزار فشرده‌سازی (ffmpeg) روی سرور آماده نشده.\n"
+                         "مدیر: /debug و /selftest را بزن.")
+        except Exception:
+            pass
+        return False
 
-    mime = (f.mime_type or "").lower()
-    name = f.name or "file"
-
-    # فشرده‌سازی ویدیو/صدا بدون ffmpeg ممکن نیست — پیام شفاف بده
-    if (info["video"] or mime.startswith("audio/")) and not FFMPEG_OK:
-        src.unlink(missing_ok=True)
-        await status.edit(
-            "⚠️ ابزار فشرده‌سازی (ffmpeg) روی سرور آماده نشده.\n"
-            "مدیر: /debug و /selftest را بزن.")
-        return
-
-    if info["video"] and (mime.startswith("video") or info["duration"] > 0):
-        kind = KIND_VIDEO
-        rows = [
-            [Button.inline("⚡ توربو — خیلی سریع (کیفیت کمتر)", b"v:turbo")],
-            [Button.inline("🎯 نصف حجم (کیفیت خوب)", b"v:half"),
-             Button.inline("📦 یک‌چهارم حجم", b"v:quarter")],
-            [Button.inline("✨ کمترین افت کیفیت", b"v:quality"),
-             Button.inline("🔬 HEVC نصف حجم", b"v:hevc")],
-            [Button.inline("🎬 480p سبک", b"v:480")],
-            [Button.inline("🎵 فقط صدا (خیلی کم‌حجم)", b"v:audio")],
-        ]
-    elif mime.startswith("image/"):
-        kind = KIND_IMAGE
-        rows = [
-            [Button.inline("🖼 کم‌حجم", b"i:soft"),
-             Button.inline("🖼 خیلی کم‌حجم", b"i:strong")],
-        ]
-    elif mime.startswith("audio/"):
-        kind = KIND_AUDIO
-        rows = [[Button.inline("🎵 کم‌حجم کن (96kbps)", b"a:96")]]
-    else:
-        src.unlink(missing_ok=True)
-        await status.edit(
-            "🤔 این نوع فایل رو نمی‌تونم فشرده کنم.\n"
-            "پشتیبانی‌شده‌ها: ویدیو 🎬 عکس 🖼 فایل صوتی 🎵"
-        )
-        return
-
-    pending[str(chat_id)] = {"src": str(src), "size": size, "kind": kind,
-                             "info": info, "name": name}
+    req["src"] = str(path)
+    req["info"] = info
+    pending[str(chat_id)] = req
     save_pending()
-    jobs[str(chat_id)] = {"name": name, "size": size, "kind": kind,
-                          "status": "در انتظار انتخاب کاربر"}
-
-    dur_txt = f" ⏱ {int(info['duration'] // 60)}:{int(info['duration'] % 60):02d}" if info.get("duration") else ""
-    dim_txt = f" 📐 {info['w']}×{info['h']}" if info.get("w") else ""
-    try:
-        await status.edit(
-            f"📄 فایل دریافت شد: {fmt_size(size)}{dur_txt}{dim_txt}\n\n"
-            f"چقدر کم‌حجمش کنم؟ 👇",
-            buttons=rows,
-        )
-    except Exception:
-        await e.reply(
-            f"📄 فایل دریافت شد: {fmt_size(size)}{dur_txt}\n\nچقدر کم‌حجمش کنم؟ 👇",
-            buttons=rows,
-        )
+    return True
 
 
 @client.on(events.CallbackQuery(pattern=r"^[via]:"))
@@ -10396,6 +10688,13 @@ async def on_button(e):
 
     await e.answer()
     busy[chat_id] = True
+    _file_job_begin(chat_id, req.get("name") or "فایل", ttl=FILE_JOB_TTL)
+    if not req.get("src"):
+        if not await _pending_download(e, chat_id, req):
+            busy[chat_id] = False
+            _file_job_end(chat_id)
+            COMPRESS_JOBS.pop(chat_id, None)
+            return
     src = Path(req["src"])
     old_size = req["size"]
     info = req["info"]
@@ -10459,6 +10758,23 @@ async def on_button(e):
             return
 
         new_size = out.stat().st_size
+        # 🔒 گارد: فایلی که از قبل فشرده بوده → خروجی بزرگ‌تر/هم‌اندازه می‌شود
+        if old_size and new_size >= old_size * 0.97:
+            try:
+                await e.edit(
+                    f"⚠️ این فایل از قبل فشرده بود.\n"
+                    f"📦 اصل: {fmt_size(old_size)} → خروجی: {fmt_size(new_size)} "
+                    "(کمتر نشد)\n\n"
+                    "پس **نسخهٔ اصلی و دست‌نخورده** را برایت می‌فرستم 👇")
+            except Exception:
+                pass
+            try:
+                await client.send_file(
+                    chat_id, str(src),
+                    caption=f"📎 نسخهٔ اصلی — فشرده‌سازی سودی نداشت ({fmt_size(old_size)})")
+            except Exception as ex:
+                await client.send_message(chat_id, f"❌ ارسال نسخهٔ اصلی ناموفق: {str(ex)[:120]}")
+            return
         pct_red = int((1 - new_size / old_size) * 100)
         note = ""
         if new_size >= old_size:
@@ -10606,6 +10922,8 @@ async def on_button(e):
         _wip_clear(chat_id)
         COMPRESS_JOBS.pop(chat_id, None)
         busy[chat_id] = False
+        _file_job_end(chat_id)
+        pending.pop(str(chat_id), None)
         for p in ([src, out] + list(locals().get("parts", []))):
             if p:
                 try:
@@ -10896,7 +11214,8 @@ def _bc_intro_card():
         lines += ["", f"🗂 آخرین ارسال: {len(it.get('ids') or [])} نفر — {when}"]
         if prev:
             lines.append("«" + ((prev[:60] + "…") if len(prev) > 60 else prev) + "»")
-    kb = [[Button.inline("🆕 اتاق جدید", b"bcr:new")]]
+    kb = [[Button.inline("🆕 اتاق جدید", b"bcr:new")],
+          [Button.inline("✉️ فقط یک پیام به یک نفر", b"pm:open")]]
     if items:
         kb.append([Button.inline("✏️ ویرایش آخرین ارسال", b"bcr:editlast")])
         kb.append([Button.inline("🗑 حذف آخرین ارسال", b"bcr:dellast")])
@@ -10908,6 +11227,189 @@ async def bc_intro(chat_id):
     """صفحهٔ «پیام به کاربران» در پنل مدیریت."""
     t, k = _bc_intro_card()
     await client.send_message(chat_id, t, buttons=k, link_preview=False)
+
+
+# ══════════════════════════════════════════════════════════════════
+# ✉️ ارسالِ سادهٔ «یک پیام» به «یک کاربر»
+#    (عینِ بخش پشتیبان: کاربر را انتخاب می‌کنی، متن/فایل می‌فرستی، تمام)
+# ══════════════════════════════════════════════════════════════════
+PM_PER_PAGE = 8
+
+
+def _pm_user_label(uid, u_):
+    nm = (u_ or {}).get("name") or str(uid)
+    un = (u_ or {}).get("uname")
+    tail = f" @{un}" if un else f" · {uid}"
+    return (nm[:22] + "…" if len(nm) > 22 else nm) + tail
+
+
+def _pm_list_card(page: int = 0):
+    items = sorted(users_seen.items(),
+                   key=lambda kv: kv[1].get("seen", 0), reverse=True)
+    total = len(items)
+    pages = max(1, (total + PM_PER_PAGE - 1) // PM_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = items[page * PM_PER_PAGE:(page + 1) * PM_PER_PAGE]
+    rows = [[Button.inline(_pm_user_label(uid, u_), f"pm:u:{uid}".encode())]
+            for uid, u_ in chunk]
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("◀️ قبلی", f"pm:list:{page - 1}".encode()))
+    nav.append(Button.inline(f"{page + 1}/{pages}", b"pm:noop"))
+    if page < pages - 1:
+        nav.append(Button.inline("بعدی ▶️", f"pm:list:{page + 1}".encode()))
+    rows.append(nav)
+    rows.append([Button.inline("⌨️ آیدی/یوزرنیم را دستی بزن", b"pm:id")])
+    rows.append([Button.inline("🔙 بازگشت", b"a:menu")])
+    txt = ("✉️ **ارسال یک پیام به یک کاربر**\n\n"
+           f"👥 کاربران شناخته‌شده: {total}\n"
+           "یکی را انتخاب کن؛ بعد متن (یا فایل/عکس/ویدیو) را بفرست.\n"
+           "پیام فقط برای همان یک نفر می‌رود و در «ارسال انبوه» ثبت نمی‌شود.")
+    return txt, rows
+
+
+async def _pm_ask(chat, uid, name=None):
+    flow[chat] = {"kind": "pm", "step": "text", "uid": int(uid), "ts": time.time()}
+    who = name or (users_seen.get(str(uid)) or {}).get("name") or str(uid)
+    await client.send_message(
+        chat,
+        f"✉️ گیرنده: **{who}** (`{uid}`)\n\n"
+        "حالا پیام را بفرست:\n"
+        "• متن ساده → همان را می‌فرستم\n"
+        "• فایل/عکس/ویدیو/ویس → همان را عیناً فوروارد می‌کنم\n\n"
+        "برای لغو: «✖ خروج از بخش»",
+        buttons=[[Button.inline("✖ لغو", b"pm:cancel")]],
+        link_preview=False)
+    try:
+        kb = room_kb()
+        await client.send_message(chat, "⌨️ منتظر پیام هستم…", buttons=kb)
+    except Exception:
+        pass
+
+
+async def _pm_send(chat, uid, text=None, msg=None):
+    """ارسال واقعی: متن یا فوروارد رسانه. خروجی: (ok, توضیح)"""
+    try:
+        if msg is not None and getattr(msg, "media", None):
+            m = await asyncio.wait_for(client.forward_messages(int(uid), [msg]), timeout=180)
+            return True, "📎 رسانه فوروارد شد"
+        mid, err = await _bc_send_one(int(uid), (text or "").strip(), None)
+        if mid:
+            return True, f"✅ متن رسید (id={mid})"
+        return False, err or "نامشخص"
+    except Exception as ex:
+        return False, f"{type(ex).__name__}: {str(ex)[:120]}"
+
+
+@client.on(events.CallbackQuery(pattern=r"^pm:"))
+async def pm_cb(e):
+    if e.sender_id not in ADMIN_IDS:
+        await e.answer("فقط مدیر.", alert=True)
+        return
+    data = e.data.decode("utf-8", "ignore")
+    chat = e.chat_id
+    try:
+        await e.answer()
+    except Exception:
+        pass
+    if data == "pm:noop":
+        return
+    if data == "pm:open":
+        t, k = _pm_list_card(0)
+        await client.send_message(chat, t, buttons=k, link_preview=False)
+        raise events.StopPropagation
+    if data.startswith("pm:list:"):
+        pg = int(data.rsplit(":", 1)[1] or 0)
+        t, k = _pm_list_card(pg)
+        await client.send_message(chat, t, buttons=k, link_preview=False)
+        raise events.StopPropagation
+    if data.startswith("pm:u:"):
+        uid = data.rsplit(":", 1)[1]
+        await _pm_ask(chat, int(uid))
+        raise events.StopPropagation
+    if data == "pm:id":
+        flow[chat] = {"kind": "pm", "step": "id", "ts": time.time()}
+        await client.send_message(
+            chat, "⌨️ آیدی عددی (مثل `123456789`) یا یوزرنیم (`@name`) را بفرست:",
+            buttons=[[Button.inline("✖ لغو", b"pm:cancel")]])
+        try:
+            await client.send_message(chat, "…", buttons=room_kb())
+        except Exception:
+            pass
+        raise events.StopPropagation
+    if data == "pm:cancel":
+        flow.pop(chat, None)
+        try:
+            await e.edit("✖ لغو شد.", buttons=None)
+        except Exception:
+            pass
+        await client.send_message(chat, "🏠 منوی اصلی 👇", buttons=kb_for(chat))
+        raise events.StopPropagation
+    raise events.StopPropagation
+
+
+@client.on(events.NewMessage(func=lambda e: e.is_private
+                             and e.sender_id in ADMIN_IDS
+                             and (flow.get(e.chat_id) or {}).get("kind") == "pm"))
+async def pm_capture(e):
+    chat = e.chat_id
+    st = flow.get(chat) or {}
+    step = st.get("step")
+    raw = (e.raw_text or "").strip()
+    if raw.startswith("/") and raw.split()[0] in ("/cancel", "/end", "/home", "/exit"):
+        flow.pop(chat, None)
+        await _go_home(chat)
+        raise events.StopPropagation
+    if step == "id":
+        tok = raw.lstrip("@")
+        uid = None
+        if tok.isdigit():
+            uid = int(tok)
+        elif tok:
+            try:
+                ent = await client.get_entity(tok)
+                uid = int(getattr(ent, "id", 0) or 0)
+                if uid:
+                    users_seen.setdefault(str(uid), {})["uname"] = tok
+                    users_seen[str(uid)]["name"] = getattr(ent, "first_name", None) or tok
+                    save_users()
+            except Exception as ex:
+                await e.reply(f"❌ پیدا نشد: {type(ex).__name__}\n"
+                              "یوزرنیم را با @ بفرست یا آیدی عددی بده.")
+                raise events.StopPropagation
+        if not uid:
+            await e.reply("❗️ آیدی عددی یا @یوزرنیم بفرست.")
+            raise events.StopPropagation
+        await _pm_ask(chat, uid)
+        raise events.StopPropagation
+    if step != "text":
+        return
+    uid = int(st.get("uid") or 0)
+    if not uid:
+        flow.pop(chat, None)
+        await e.reply("❗️ گیرنده گم شد — از دکمهٔ «✉️ پیام به یک کاربر» دوباره شروع کن.")
+        raise events.StopPropagation
+    ok, why = await _pm_send(chat, uid, text=e.raw_text, msg=e.message)
+    flow.pop(chat, None)
+    who = (users_seen.get(str(uid)) or {}).get("name") or str(uid)
+    if ok:
+        await e.reply(f"✅ به **{who}** ارسال شد.\n{why}",
+                      buttons=[[Button.inline("✉️ پیام دیگر به همین نفر",
+                                              f"pm:u:{uid}".encode())],
+                               [Button.inline("👥 نفر دیگر", b"pm:open")],
+                               [Button.inline("🏠 منوی اصلی", b"a:menu")]])
+    else:
+        await e.reply(
+            f"❌ ارسال به {who} نشد:\n`{why}`\n\n"
+            "💡 رایج‌ترین دلیل: کاربر هنوز /start نزده یا ربات را بلاک کرده.",
+            buttons=[[Button.inline("🔁 تلاش دوباره", f"pm:u:{uid}".encode())],
+                     [Button.inline("👥 نفر دیگر", b"pm:open")]],
+            link_preview=False)
+    try:
+        await client.send_message(chat, "🏠 منوی اصلی 👇", buttons=kb_for(chat))
+    except Exception:
+        pass
+    raise events.StopPropagation
 
 
 def _bc_new_room(chat):
@@ -11017,6 +11519,25 @@ async def _bc_apply_delete(chat):
         f"{'⏹ متوقف شد' if room.get('abort') else '🗑 حذف تمام شد'}\n"
         f"✅ موفق: {ok}   ❌ ناموفق: {fail}",
         buttons=[[Button.inline("🔙 منوی پیام‌رسانی", b"bcr:menu")]])
+
+
+async def _ev_msg_obj(e):
+    """پیامِ رویداد به‌صورت امن.
+
+    در تلگرام/Telethon جدید، رویدادِ دکمه (`CallbackQuery.Event`) ویژگیِ
+    `.message` **ندارد** و باید `await e.get_message()` صدا زده شود؛
+    همین باعث خطای «'Event' object has no attribute 'message'» می‌شد.
+    """
+    m = getattr(e, "message", None)
+    if m is not None:
+        return m
+    gm = getattr(e, "get_message", None)
+    if gm is not None:
+        try:
+            return await gm()
+        except Exception:
+            return None
+    return None
 
 
 async def _bc_send_one(uid, text, media):
@@ -11403,7 +11924,7 @@ async def bc_room_cb(e):
         room["step"] = "sending"
         _bc_rooms_save()
         try:
-            await _bc_send(room, e.message)
+            await _bc_send(room, await _ev_msg_obj(e), e.chat_id)
         except Exception as ex:
             try:
                 await client.send_message(
