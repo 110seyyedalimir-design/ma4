@@ -23,6 +23,8 @@ import time
 from datetime import datetime, timedelta
 from collections import deque
 from pathlib import Path
+import pathlib          # بخش «لینک مستقیم»
+import urllib.parse      # بخش «لینک مستقیم»
 
 from PIL import Image, ImageOps
 from telethon import Button, TelegramClient, events
@@ -243,6 +245,57 @@ BTN_FINDER = "🔎 مزاحم‌یاب"
 BTN_SUB = "💎 اشتراک"
 BTN_DL = "📥 کانال محدود"
 BTN_TAG = "🏷 تگ فایل"
+BTN_COMP = "🗜 کم‌حجم کردن"     # بخش ایزولهٔ کم‌حجم‌سازی
+BTN_HOME = "🏠 منوی اصلی"       # خروج از هر بخش
+BTN_PROFILE = "👤 اطلاعات من"   # کارت کاربر (طلا/دعوت)
+
+# دکمهٔ کیبورد → کلید قابلیت (برای خط‌خوردن و پیام «غیرفعال است»)
+BTN_FEAT = {
+    BTN_COMP: "compress", BTN_TAG: "tag", BTN_DL: "dl", BTN_AI: "ai",
+    BTN_STT: "stt", BTN_LINK: "link", BTN_YT: "yt", BTN_INSTA: "insta",
+    BTN_BARGH: "bargh", BTN_FINDER: "finder", BTN_ANTEN: "anten",
+    BTN_SELFDES: "sd",
+}
+FEAT_OFF_SUFFIX = " (غیرفعال)"
+STRIKE_CH = "\u0336"
+
+
+def _plain_label(t):
+    """برچسب دکمه را از خط‌خوردگی و «(غیرفعال)» پاک می‌کند."""
+    t = str(t or "").replace(STRIKE_CH, "")
+    t = t.replace(FEAT_OFF_SUFFIX.strip(), "").strip()
+    while "  " in t:
+        t = t.replace("  ", " ")
+    return t.strip()
+
+
+def _feat_of_label(t):
+    return BTN_FEAT.get(_plain_label(t))
+
+
+async def _locked_feat_early(e):
+    """دکمهٔ یک قابلیتِ خاموش‌شده → فقط همان یک پیام: «فعلاً این امکان غیرفعال است.»
+
+    (اول از همه ثبت می‌شود تا هیچ بخشی پیام دیگری نفرستد.)
+    """
+    try:
+        if getattr(e, "out", False):
+            return
+        if not (getattr(e, "raw_text", None) or getattr(e, "text", "") or "").strip():
+            return
+        if e.sender_id in ADMIN_IDS:
+            return                                # مدیر همیشه آزاد
+        feat = _feat_of_label(e.text)
+        if not feat:
+            return
+        fe = globals().get("feature_enabled")
+        if fe and not fe(feat):
+            await e.reply("⛔ فعلاً این امکان غیرفعال است.")
+            raise events.StopPropagation
+    except events.StopPropagation:
+        raise
+    except Exception:
+        pass
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(message)s", level=logging.INFO
@@ -288,6 +341,15 @@ client = TelegramClient(
 _STARTUP_TS = time.time()
 
 
+async def safe_edit(msg, text, buttons=None):
+    """ویرایش بی‌صدای پیام وضعیت: اگر متن یکی بود یا تلگرام اجازه نداد، خطا ندهد."""
+    try:
+        await msg.edit(str(text)[:4000], buttons=buttons, link_preview=False)
+        return True
+    except Exception:
+        return False
+
+
 async def _stale_guard(e):
     """نگهبان ضد-بازپخش:
     ۱) ۲۰ ثانیه‌ی اول بعد از راه‌اندازی: همه‌ی به‌روزرسانی‌های انباشته رد می‌شوند
@@ -324,6 +386,14 @@ async def _stale_guard(e):
 
 client.add_event_handler(_stale_guard, events.NewMessage())
 client.add_event_handler(_stale_guard, events.CallbackQuery())
+async def _bc_room_early(e):
+    """اتاق پیام‌رسانی: اول از همه، قبل از فشرده‌سازی/تگ/…"""
+    fn = globals().get("_bc_room_capture")
+    if fn is None:
+        return
+    await fn(e)
+client.add_event_handler(_locked_feat_early, events.NewMessage())  # قابلیت خاموش → یک پیام
+client.add_event_handler(_bc_room_early, events.NewMessage())   # اتاق پیام‌رسانی: قبل از همهٔ بخش‌ها
 PROCESS_START = time.time()
 
 
@@ -354,6 +424,11 @@ async def _tag_room_text(e):
         return                      # خوش‌آمد را خودِ دکمه می‌فرستد — بدون واکنشِ دوباره
     if "DATA|" in t:
         return                      # بازیابی داده‌ی مدیر — عبور
+    if t in (BTN_HOME, "/home", "/exit"):
+        # 🏠 خروج فوری از اتاق تگ (دکمهٔ سراسری خروج)
+        flow.pop(e.chat_id, None)
+        await e.reply("🏠 از اتاق تگ خارج شدی.", buttons=kb_for(e.chat_id))
+        raise events.StopPropagation
     if t.startswith("/") and t != "/end":
         await e.reply(
             "🔒 داخل اتاقِ تگ هستی — دستورها موقتاً قفلند.\n\n"
@@ -362,7 +437,7 @@ async def _tag_room_text(e):
         raise events.StopPropagation
     if t in (BTN_HELP, BTN_STATUS, BTN_ADMIN, BTN_BARGH, BTN_SUPPORT, BTN_SELFDES,
              BTN_AI, BTN_YT, BTN_FINDER, BTN_SUB, BTN_INSTA, BTN_ANTEN, BTN_STT,
-             BTN_LINK, BTN_DL):
+             BTN_LINK, BTN_DL, BTN_COMP, BTN_PROFILE):
         await e.reply(
             "🔒 داخل اتاقِ تگ هستی — فعلاً فقط همین بخش کار می‌کند.\n\n"
             "«⏭ مرحله بعد» برای رد کردن مرحله / «✖ لغو و خروج» برای خروج",
@@ -401,20 +476,20 @@ async def _tag_room_file(e):
 
 WELCOME = (
     "سلام! 👋\n\n"
-    "من ربات کم‌حجم‌کننده‌ی فایل‌ام 🗜\n"
-    "فایلت رو بفرست تا برات فشرده کنم:\n\n"
-    "🎬 ویدیو → تا ۱٫۸ گیگابایت\n"
-    "🖼 عکس → کم‌حجم و بهینه\n"
-    "🎵 فایل صوتی → سبک و کم‌حجم\n\n"
-    "📖 برای یادگیری همه‌ی امکانات، دکمه‌ی «راهنما» رو بزن\n"
-    "⏱ درصد پیشرفت رو زنده نشون می‌دم 😉"
+    "من ربات چندکاره‌ام — هر بخش، جدا و با دکمهٔ خودش: 🗜\n\n"
+    "🗜 کم‌حجم کردن → اول دکمهٔ «🗜 کم‌حجم کردن» را بزن،\n"
+    "    بعد فایل را همان‌جا بفرست (ویدیو تا ۱٫۸ گیگ، عکس، صدا)\n"
+    "🏷 تگ/تغییر نام • 📥 کانال محدود • 🎬 یوتیوب • 🤖 هوش مصنوعی\n"
+    "👤 اطلاعات من (طلایی/دعوت) • 🏠 منوی اصلی (خروج از هر بخش)\n\n"
+    "📖 راهنمای کامل: دکمهٔ «📖 راهنما»"
 )
 
 HELP_TEXT = (
     "📖 راهنمای ربات فشرده‌سازی\n"
     "─────────────────────\n"
     "🎞 چطور کار می‌کنه؟\n"
-    "۱. فایلت رو بفرست (ویدیو / عکس / صدا)\n"
+    "۱. اول دکمهٔ «🗜 کم‌حجم کردن» را بزن، بعد فایل را همان‌جا بفرست\n"
+    "   (بدون باز کردن این بخش، فایل‌ها فشرده نمی‌شوند)\n"
     "۲. یکی از حالت‌ها رو انتخاب کن\n"
     "۳. صبر کن — درصد پیشرفت زنده نشون داده می‌شه و فایل کم‌حجم میاد\n\n"
     "🎛 حالت‌های ویدیو:\n"
@@ -440,6 +515,7 @@ busy = {}
 jobs = {}
 history = deque(maxlen=100)
 users_seen = {}          # str(id) → {name, uname, seen, jobs}
+DL_DLG = {}              # chat_id → {pairs, group, ts} نتیجهٔ جستجوی کانال/گروه
 admins_known = set()     # مدیرهایی که /admin زدند → دکمه‌ی پنل برایشان ظاهر می‌شود
 
 
@@ -532,24 +608,28 @@ async def note_user(e):
 
 
 def _kl(label):
-    """برچسب کیبورد با احترام به قابلیت‌های غیرفعال (خط‌خورده)."""
-    key = {BTN_AI: "ai", BTN_YT: "yt", BTN_DL: "dl", BTN_TAG: "tag",
-           BTN_ANTEN: "anten", BTN_FINDER: "finder", BTN_SELFDES: "sd"}.get(label)
-    return _strike(label) if (key and not feature_enabled(key)) else label
+    """برچسب کیبورد: قابلیت خاموش ⇒ خط‌خورده + «(غیرفعال)»."""
+    key = BTN_FEAT.get(label)
+    if key and not feature_enabled(key):
+        return _strike(label) + FEAT_OFF_SUFFIX
+    return label
 
 
 def kb_for(chat_id):
+    """کیبورد اصلی — هر دکمهٔ قابلیت با _kl (خاموش ⇒ خط‌خورده)."""
+    rows = [[Button.text(_kl(BTN_COMP), resize=True), Button.text(BTN_HELP)]]
     if chat_id in ADMIN_IDS:
-        rows = [[Button.text(BTN_HELP, resize=True), Button.text(BTN_STATUS)]]
+        rows.append([Button.text(BTN_STATUS), Button.text(BTN_PROFILE)])
+        rows.append([Button.text(_kl(BTN_BARGH)), Button.text(BTN_SUPPORT)])
+        rows.append([Button.text(BTN_HOME)])
     else:
-        rows = [[Button.text(BTN_HELP, resize=True)]]
-    rows.append([Button.text(BTN_BARGH), Button.text(BTN_SUPPORT)])
+        rows.append([Button.text(BTN_PROFILE), Button.text(_kl(BTN_BARGH))])
+        rows.append([Button.text(BTN_HOME), Button.text(BTN_SUPPORT)])
     rows.append([Button.text(_kl(BTN_ANTEN)), Button.text(_kl(BTN_SELFDES))])
     rows.append([Button.text(_kl(BTN_YT)), Button.text(_kl(BTN_AI))])
-    rows.append([Button.text(BTN_STT), Button.text(BTN_LINK)])
-    rows.append([Button.text(BTN_INSTA)])
-    rows.append([Button.text(_kl(BTN_DL)), Button.text(_kl(BTN_TAG))])
-    rows.append([Button.text("👤 اطلاعات من"), Button.text(_kl(BTN_FINDER))])
+    rows.append([Button.text(_kl(BTN_STT)), Button.text(_kl(BTN_LINK))])
+    rows.append([Button.text(_kl(BTN_INSTA)), Button.text(_kl(BTN_DL))])
+    rows.append([Button.text(_kl(BTN_TAG)), Button.text(_kl(BTN_FINDER))])
     rows.append([Button.text(BTN_SUB)])
     if chat_id in ADMIN_IDS:
         rows.append([Button.text(BTN_ADMIN)])
@@ -845,6 +925,15 @@ async def cmd_start(e):
     if not e.is_private:
         return
     await note_user(e)
+    # 🏠 /start = خروج از هر بخش و شروع تازه
+    try:
+        flow.pop(e.chat_id, None)
+    except Exception:
+        pass
+    try:
+        globals().get("BC_ROOMS", {}).pop(e.chat_id, None)
+    except Exception:
+        pass
     is_admin = e.sender_id in ADMIN_IDS
     text = WELCOME if e.text == "/start" else HELP_TEXT
     await e.reply(text, buttons=kb_for(e.chat_id))
@@ -7155,7 +7244,7 @@ INSTA_RE = re.compile(
 @client.on(events.NewMessage(pattern=r"^📸 اینستاگرام$"))
 async def btn_insta(e):
     await note_user(e)
-    if not is_allowed_feat(e.chat_id, "yt"):
+    if not is_allowed_feat(e.chat_id, "insta"):
         await e.reply(_need_sub_reply(e.chat_id))
         return
     if not INSTA_OK:
@@ -8852,13 +8941,10 @@ async def on_admin_cb(e):
 
     # ─── 👑 مدیریت طلایی / ⚙️ قابلیت‌ها ───────────────────────
     if data == "gold":
-        await say("👑 مدیریت اکانت‌های طلایی\n\n"
-                  "روش سریع: روی دکمهٔ زیر بزن، سپس **اسم، @یوزرنیم یا آیدی عددی** را تایپ و ارسال کن.\n"
-                  "یا دستور: `/gsearch <عبارت>`\n\n"
-                  "در نتایج با یک ضربه، طلایی را فعال/غیرفعال کن؛ 🔄 هم اطلاعات کامل کاربر را نشان می\u200cدهد.",
-                  [[Button.switch_inline("🔍 شروع جستجو", "gfind ", same_peer=True)],
-                   [Button.inline("📊 آمار و فهرست طلایی‌ها", b"a:gstats")],
-                   [Button.inline("🔙 بازگشت", b"a:menu")]])
+        # فهرست همهٔ کاربران (صفحه‌به‌صفحه) — با دکمهٔ جستجو در همان صفحه
+        GOLD_VIEW[chat] = ("list", 0)
+        t, k = _gold_page_card(0)
+        await say(t, k)
         return
     if data == "gstats":
         await say(_golds_stats(), [[Button.inline("🔙 مدیریت طلایی", b"a:gold")]])
@@ -9315,6 +9401,9 @@ async def cmd_get(e):
 async def on_text(e):
     if not e.is_private:
         return
+    _tt = (e.text or "").strip()
+    if _tt in (BTN_HOME, BTN_COMP, BTN_PROFILE, "/home", "/exit", "/compress"):
+        return                    # هندلرهای اختصاصی خودشان جواب می‌دهند
     # مدیر پیام پشتیبان را فرستاد/فوروارد کرد → بازیابی خودکار
     if e.sender_id in ADMIN_IDS and "DATA|" in (e.text or "") and "🗂" in (e.text or ""):
         tgstore.import_payload(e.text)
@@ -9324,6 +9413,24 @@ async def on_text(e):
     if e.chat_id in login_flow and e.sender_id in ADMIN_IDS:
         await handle_login_text(e)
         return
+    # 🔒 اتاق کم‌حجم‌سازی: هر متنی اینجا فقط پیام راهنما می‌گیرد
+    if (flow.get(e.chat_id) or {}).get("kind") == "compress":
+        if _tt not in (BTN_HOME, "/home", "/exit"):
+            await e.reply(
+                "🗜 داخل بخش کم‌حجم‌سازی هستی — فقط فایل/ویدیو/عکس بفرست.\n\n"
+                "برای خروج: «✖ خروج از بخش» یا «🏠 منوی اصلی»",
+                buttons=[[Button.inline("✖ خروج از بخش", b"cmp:exit")]])
+            raise events.StopPropagation
+    # 🔎 اتاق جستجوی کاربر (مدیر)
+    if (flow.get(e.chat_id) or {}).get("kind") == "goldsearch":
+        if e.sender_id in ADMIN_IDS:
+            GOLD_SEARCH[e.chat_id] = _tt
+            GOLD_VIEW[e.chat_id] = ("search", _tt)
+            _t2, _k2 = _gold_results(_tt)
+            await e.reply(_t2, buttons=_k2)
+        else:
+            await e.reply("این بخش فقط برای مدیر است.")
+        raise events.StopPropagation
     st_sd = flow.get(e.chat_id)
     if st_sd and st_sd.get("kind") == "sd":
         await handle_sd_login_text(e)
@@ -9529,8 +9636,11 @@ async def on_text(e):
                     await safe_edit(status, f"❌ {str(ex)[:120]}")
             return
     await e.reply(
-        "🤖 فایلت رو بفرست تا کم‌حجمش کنم 🗜\n"
-        "راهنمای کامل: /help",
+        "🤔 متوجه نشدم چی می‌خواهی — یکی از دکمه‌های زیر را بزن:\n\n"
+        "🗜 کم‌حجم کردن فایل → دکمهٔ «🗜 کم‌حجم کردن»\n"
+        "🏷 تگ/تغییر نام → «🏷 تگ فایل»\n"
+        "👤 وضعیت و لینک دعوت → «👤 اطلاعات من»\n"
+        "📖 راهنمای کامل → «📖 راهنما»",
         buttons=kb_for(e.chat_id),
     )
 
@@ -9566,7 +9676,7 @@ STT_FLOW = {}      # chat_id → {"ts":..., "waiting": bool}
 @client.on(events.NewMessage(pattern=r"^🎙 ویس به متن$"))
 async def btn_stt(e):
     await note_user(e)
-    if not is_allowed_feat(e.chat_id, "ai"):
+    if not is_allowed_feat(e.chat_id, "stt"):
         await e.reply(_need_sub_reply(e.chat_id))
         return
     if not AI_OK:
@@ -9601,7 +9711,7 @@ LINK_FLOW = {}     # chat_id → {"ts":...}
 @client.on(events.NewMessage(pattern=r"^🔗 فایل به لینک$"))
 async def btn_link(e):
     await note_user(e)
-    if not is_allowed_feat(e.chat_id, "ai"):
+    if not is_allowed_feat(e.chat_id, "link"):
         await e.reply(_need_sub_reply(e.chat_id))
         return
     if not TOOLS_OK:
@@ -9757,7 +9867,8 @@ async def on_file(e):
     # (ویس ادمین وقتی دستیار روشن است → دستیار هوشمند هندل می‌کند، نه اینجا)
     _voice_to_agent = (e.sender_id in ADMIN_IDS and AGENT_ENABLED
                        and user_client and user_client.is_connected())
-    if e.message.voice and AI_OK and not _voice_to_agent and is_allowed_feat(chat_id, "ai"):
+    if (e.message.voice and AI_OK and not _voice_to_agent
+            and is_allowed_feat(chat_id, "ai") and is_allowed_feat(chat_id, "stt")):
         try:
             path = await e.message.download_media(file="/tmp/stt_voice.ogg")
             await _stt_flow(e, path, "ویس")
@@ -9822,6 +9933,18 @@ async def on_file(e):
             await e.reply(f"❌ {str(ex)[:120]}")
         return
 
+    # 🔒 ایزوله: فشرده‌سازی فقط وقتی انجام می‌شود که کاربر داخل بخش «🗜 کم‌حجم کردن» باشد
+    _room_kind = (flow.get(chat_id) or {}).get("kind")
+    if _room_kind != "compress":
+        if _room_kind:
+            return                       # داخل بخش دیگری است → به همان بخش واگذار کن
+        await e.reply(
+            "🗜 برای کم‌حجم کردن، اول بخشش را باز کن و فایل را همان‌جا بفرست:\n"
+            "دکمهٔ «🗜 کم‌حجم کردن» را بزن (یا دکمهٔ زیر).\n\n"
+            "💡 فایل‌های دیگر بخش‌ها: تگ، دانلود از کانال، ویس به متن، فایل به لینک.",
+            buttons=[[Button.inline("🗜 باز کردن بخش کم‌حجم‌سازی", b"cmp:open")],
+                     [Button.inline("🏠 منوی اصلی", b"home:open")]])
+        return
     # قفل اشتراک برای فشرده‌سازی
     if not is_allowed_feat(chat_id, "compress"):
         await e.reply(_need_sub_reply(chat_id),
@@ -10218,21 +10341,87 @@ async def on_button(e):
 
 
 
-# ═══════════════ 📣 پیام همگانی مدیر (Broadcast) ═══════════════
-# طرز کار: مدیر متن/رسانهٔ نهایی را (ترجیحاً یک‌جا در سیو مسیج) آماده می‌کند و
-# روی آن `/bc` می‌زند؛ سپس با دکمه‌های تیک‌دار گیرنده‌ها را انتخاب و ارسال می‌کند.
-# همهٔ تعاملات بعدی CallbackQuery است تا هیچ تداخلی با سایر بخش‌های ربات نداشته باشد.
-BCAST = {}                 # chat_id(مدیر) → state
-BCAST_MAX_LIST = 60        # بیش از این تعداد، فهرست دکمه‌ای نشان داده نمی‌شود (بقیه فقط با «همه»)
+# ═══════════════ 📣 اتاق پیام‌رسانی (Broadcast Room) ═══════════════
+# مدیر دکمهٔ «📣 پیام به کاربران» را می‌زند → یک **اتاق ایزوله** ساخته می‌شود.
+#   ۱) در اتاق، پیام را می‌نویسد یا فوروارد می‌کند
+#   ۲) گروه گیرنده را با دکمه انتخاب می‌کند
+#   ۳) بازبینی و تأیید
+#   ۴) ارسال — و بعد از ارسال هم می‌تواند **ویرایش** یا **حذف** کند
+# همه‌چیز دکمه‌ای است، هیچ دستوری لازم نیست. هر مرحله دکمهٔ «❌ لغو» دارد.
+BC_ROOMS = {}                       # chat_id مدیر → اتاق
+BC_ROOMS_FILE = Path("/tmp/bc_rooms.json")
+BC_SENT_FILE = Path("/tmp/bc_sent.json")
+BC_SENT_MAX = 5000                  # حداکثر شناسه‌های نگه‌داری‌شده برای ویرایش/حذف پس از ارسال
+BC_GROUP_LABELS = [
+    ("all",     "👥 همهٔ کاربران"),
+    ("gold",    "👑 فقط طلایی‌ها"),
+    ("nongold", "🆓 فقط غیرطلایی"),
+    ("active",  "🔥 کاربران فعال"),
+    ("subs",    "🔑 مشترکین فعال"),
+]
 
 
-def _bc_cleanup(st):
-    mp = st.get("media")
-    if mp:
+def _bc_rooms_load():
+    global BC_ROOMS
+    try:
+        raw = json.loads(BC_ROOMS_FILE.read_text())
+        BC_ROOMS = {int(k): v for k, v in raw.items() if isinstance(v, dict)}
+    except Exception:
+        BC_ROOMS = {}
+
+
+def _bc_rooms_save():
+    try:
+        alive = {}
+        for k, v in BC_ROOMS.items():
+            mp = v.get("media")
+            r = dict(v)
+            if mp and not Path(str(mp)).exists():
+                r["media"] = None
+            alive[str(k)] = r
+        BC_ROOMS_FILE.write_text(json.dumps(alive, ensure_ascii=False))
+        persist.mark_dirty()
+    except Exception:
+        pass
+
+
+def _bc_sent_load() -> dict:
+    try:
+        d = json.loads(BC_SENT_FILE.read_text())
+        if not isinstance(d, dict):
+            return {"items": []}
+        d.setdefault("items", [])
+        return d
+    except Exception:
+        return {"items": []}
+
+
+def _bc_sent_save(d):
+    try:
+        BC_SENT_FILE.write_text(json.dumps(d, ensure_ascii=False))
+        persist.mark_dirty()
+    except Exception:
+        pass
+
+
+def _bc_sent_push(item):
+    d = _bc_sent_load()
+    items = d.get("items") or []
+    items.insert(0, item)
+    d["items"] = items[:5]
+    _bc_sent_save(d)
+
+
+def _bc_subs_ids():
+    now = time.time()
+    out = []
+    for k, exp in (SUBS.get("allowed") or {}).items():
         try:
-            Path(mp).unlink(missing_ok=True)
+            if float(exp) > now:
+                out.append(int(k))
         except Exception:
-            pass
+            continue
+    return out
 
 
 def _bc_targets():
@@ -10241,7 +10430,7 @@ def _bc_targets():
     for k, v in (users_seen or {}).items():
         try:
             uid = int(k)
-        except ValueError:
+        except Exception:
             continue
         if uid <= 0 or uid in ADMIN_IDS:
             continue
@@ -10252,31 +10441,539 @@ def _bc_targets():
     return [(u, n) for u, n, _ in rows]
 
 
-def _bc_menu(st):
-    ids = st["ids"]
-    sel = st["sel"]                                  # None یعنی «همه»
-    count = len(ids) if sel is None else len(sel or set())
-    prev = (st.get("text") or "").strip().replace("\n", " ")
-    prev = (prev[:110] + "…") if len(prev) > 110 else (prev or "—")
-    lines = ["📣 ارسال پیام همگانی",
-             f"📝 متن: {prev}",
-             ("📎 رسانه: دارد ✅" if st.get("media") else "📎 رسانه: ندارد"),
-             f"👥 گیرنده‌ها: {count} از {len(ids)} نفر", ""]
-    kb = [[Button.inline("👥 همهٔ کاربران" + (" ✅" if sel is None else " ⬜"), b"bc:all")]]
-    pool = ids[:BCAST_MAX_LIST]
-    for i in range(0, len(pool), 3):
-        row = []
-        for uid in pool[i:i + 3]:
-            on = (sel is None) or (uid in (sel or set()))
-            lab = (("✔️ " if on else "◻️ ") + st["names"].get(uid, str(uid)))[:32]
-            row.append(Button.inline(lab, f"bc:t:{uid}".encode()))
-        kb.append(row)
-    if len(ids) > BCAST_MAX_LIST:
-        lines.append(f"⚠️ فقط {BCAST_MAX_LIST} نفر اول فهرست شده‌اند؛ بقیه با «همه» انتخاب می‌شوند.")
-    kb.append([Button.inline(f"📤 ارسال به {count} نفر", b"bc:go"),
-               Button.inline("✖ لغو", b"bc:cancel")])
+def _bc_group_ids(key) -> list:
+    """شناسه‌های گیرندهٔ یک گروه — همه از فهرست کاربران دیده‌شده (بدون ادمین‌ها)."""
+    all_ids = [u for u, _ in _bc_targets()]
+    if key == "gold":
+        return [u for u in all_ids if is_gold(u)]
+    if key == "nongold":
+        return [u for u in all_ids if not is_gold(u)]
+    if key == "active":
+        return [u for u in all_ids
+                if int((users_seen.get(str(u)) or {}).get("jobs") or 0) > 0]
+    if key == "subs":
+        s = set(_bc_subs_ids())
+        return [u for u in all_ids if u in s]
+    return all_ids
+
+
+def _bc_media_name(media) -> str:
+    if not media:
+        return "ندارد"
+    ext = Path(str(media)).suffix.lower()
+    kind = ("📷 عکس" if ext in (".jpg", ".jpeg", ".png", ".webp")
+            else "🎬 ویدیو" if ext in (".mp4", ".mkv", ".mov", ".webm")
+            else "🎵 صدا" if ext in (".mp3", ".m4a", ".ogg", ".opus")
+            else "📄 فایل")
+    return f"{kind} ({Path(str(media)).name[:34]})"
+
+
+def _bc_room_card(room):
+    """متن + دکمه‌های اتاق بر اساس مرحله‌ای که در آن است."""
+    step = room.get("step", "content")
+    rid = room.get("rid", "—")
+    txt = (room.get("text") or "").strip()
+    media = room.get("media")
+    if media and not Path(str(media)).exists():
+        media = None
+        room["media"] = None
+    head = f"📣 اتاق پیام‌رسانی  •  {rid}"
+    kb = []
+
+    if step == "content":
+        body = ("مرحلهٔ ۱ از ۳ — محتوا\n\n"
+                "پیام نهایی‌ات را همین‌جا **بنویس** یا **فوروارد** کن.\n"
+                "متن + عکس/ویدیو/فایل هم با هم قبول است.\n"
+                "(چند عکسِ آلبومی با هم؟ فقط اولی گرفته می‌شود — یکی‌یکی بفرست.)\n\n"
+                "⛔ تا وقتی داخل این اتاق هستی، پیام‌هایت جای دیگری نمی‌روند.")
+        kb = [[Button.inline("❌ لغو و خروج از اتاق", b"bcr:cancel")]]
+
+    elif step == "targets":
+        body = ("مرحلهٔ ۲ از ۳ — گیرنده‌ها\n\n"
+                "✅ محتوا ثبت شد:\n"
+                f"📝 {(txt[:80] + '…') if len(txt) > 80 else (txt or '(بدون متن)')}\n"
+                f"📎 {_bc_media_name(media)}\n\n"
+                "گروه گیرنده را انتخاب کن:")
+        for key, label in BC_GROUP_LABELS:
+            kb.append([Button.inline(f"{label} — {len(_bc_group_ids(key))} نفر",
+                                     f"bcr:g:{key}".encode())])
+        kb.append([Button.inline("✏️ ویرایش محتوا", b"bcr:edit"),
+                   Button.inline("❌ لغو", b"bcr:cancel")])
+
+    elif step == "review":
+        grp = room.get("grp") or "all"
+        glabel = dict(BC_GROUP_LABELS).get(grp, grp)
+        cnt = len(_bc_group_ids(grp))
+        prev = txt.replace("\n", " ")
+        body = ("مرحلهٔ ۳ از ۳ — بازبینی و تأیید\n\n"
+                f"👥 گیرنده: {glabel} — **{cnt} نفر**\n"
+                f"📝 متن: {(prev[:180] + '…') if len(prev) > 180 else (prev or '(بدون متن)')}\n"
+                f"📎 رسانه: {_bc_media_name(media)}\n\n"
+                "اگر همه‌چیز درست است «📤 ارسال نهایی» را بزن.")
+        kb = [[Button.inline(f"📤 ارسال نهایی به {cnt} نفر", b"bcr:go")],
+              [Button.inline("✏️ ویرایش", b"bcr:edit"),
+               Button.inline("👥 تغییر گروه", b"bcr:grp")],
+              [Button.inline("❌ لغو و خروج", b"bcr:cancel")]]
+
+    elif step == "edittext":
+        body = ("✏️ متن تازهٔ پیام را همین‌جا بفرست.\n"
+                "(اگر رسانه داری، این متن کپشنِ آن می‌شود.)\n\n"
+                "برای برگشت بدون تغییر، دکمهٔ «انصراف» را بزن.")
+        kb = [[Button.inline("❌ انصراف", b"bcr:back")]]
+
+    elif step == "editsent":
+        body = ("✏️ متن جدید برای ویرایش پیامِ **ارسال‌شده** را بفرست.\n\n"
+                "همهٔ گیرنده‌ها همین متن را جای پیام قبلی می‌بینند.\n"
+                "(روی پیام‌های رسانه‌ای، کپشن عوض می‌شود.)")
+        kb = [[Button.inline("❌ انصراف", b"bcr:menu")]]
+
+    elif step == "sending":
+        body = "📣 در حال ارسال…"
+        kb = [[Button.inline("⏹ توقف", b"bcr:stop")]]
+
+    else:                                        # done
+        body = ("✅ اتاق تمام شد.\n\n"
+                "می‌توانی همین حالا پیامِ ارسال‌شده را **ویرایش** یا **حذف** کنی:\n"
+                f"✅ موفق: {room.get('sent_ok', '-')}    ❌ ناموفق: {room.get('sent_fail', '-')}")
+        kb = [[Button.inline("✏️ ویرایش ارسال‌شده", b"bcr:editlast")],
+              [Button.inline("🗑 حذف ارسال‌شده", b"bcr:dellast")],
+              [Button.inline("🆕 اتاق جدید", b"bcr:new"),
+               Button.inline("🔙 منوی پیام‌رسانی", b"bcr:menu")]]
+
+    preview = ""
+    if step in ("targets", "review") and txt:
+        preview = ""
+    return f"{head}\n\n{body}{preview}", kb
+
+
+def _bc_intro_card():
+    items = (_bc_sent_load().get("items") or [])
+    lines = ["📣 پیام به کاربران", "",
+             "بدون هیچ دستوری — فقط دکمه:", "",
+             "🆕 اتاق جدید → پیام را می‌نویسی یا فوروارد می‌کنی،",
+             "بعد گیرنده‌ها را انتخاب می‌کنی، بازبینی می‌کنی و ارسال.",
+             "هر مرحله دکمهٔ ❌ لغو دارد."]
+    if items:
+        it = items[0]
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(it.get("ts") or 0))
+        prev = (it.get("text") or "").strip().replace("\n", " ")
+        lines += ["", f"🗂 آخرین ارسال: {len(it.get('ids') or [])} نفر — {when}"]
+        if prev:
+            lines.append("«" + ((prev[:60] + "…") if len(prev) > 60 else prev) + "»")
+    kb = [[Button.inline("🆕 اتاق جدید", b"bcr:new")]]
+    if items:
+        kb.append([Button.inline("✏️ ویرایش آخرین ارسال", b"bcr:editlast")])
+        kb.append([Button.inline("🗑 حذف آخرین ارسال", b"bcr:dellast")])
+    kb.append([Button.inline("🔙 بازگشت", b"a:menu")])
     return "\n".join(lines), kb
 
+
+async def bc_intro(chat_id):
+    """صفحهٔ «پیام به کاربران» در پنل مدیریت."""
+    t, k = _bc_intro_card()
+    await client.send_message(chat_id, t, buttons=k, link_preview=False)
+
+
+def _bc_new_room(chat):
+    old = BC_ROOMS.get(chat)
+    if old and old.get("media"):
+        try:
+            Path(str(old["media"])).unlink(missing_ok=True)
+        except Exception:
+            pass
+    room = {"rid": "B" + secrets.token_hex(2).upper(), "step": "content",
+            "text": "", "media": None, "grp": None, "created": time.time(),
+            "abort": False}
+    BC_ROOMS[chat] = room
+    _bc_rooms_save()
+    return room
+
+
+async def _bc_show_room(chat, room, note=""):
+    t, k = _bc_room_card(room)
+    if note:
+        t = f"{note}\n\n{t}"
+    return await client.send_message(chat, t, buttons=k, link_preview=False)
+
+
+async def _bc_apply_edit(chat, new_text):
+    """ویرایش پیام‌های ارسال‌شده (کپشن/متن) با نوار پیشرفت و دکمهٔ توقف."""
+    d = _bc_sent_load()
+    items = d.get("items") or []
+    if not items:
+        await client.send_message(chat, "❕هنوز ارسالی ثبت نشده.",
+                                  buttons=[[Button.inline("🔙 منو", b"bcr:menu")]])
+        return
+    it = items[0]
+    pairs = it.get("ids") or []
+    room = BC_ROOMS.setdefault(chat, {"rid": it.get("rid") or "-", "step": "done"})
+    room["abort"] = False
+    room["step"] = "done"
+    stop_kb = [[Button.inline("⏹ توقف", b"bcr:stop")]]
+    prog = await client.send_message(chat, f"✏️ ویرایش {len(pairs)} پیام…", buttons=stop_kb)
+    ok = fail = 0
+    for n, pair in enumerate(pairs, 1):
+        if room.get("abort"):
+            break
+        try:
+            uid, mid = int(pair[0]), int(pair[1])
+        except Exception:
+            continue
+        try:
+            await asyncio.wait_for(
+                client.edit_message(uid, mid, (new_text or " ")[:4000]), timeout=60)
+            ok += 1
+        except Exception:
+            fail += 1
+        if n % 20 == 0 or n == len(pairs):
+            try:
+                await prog.edit(f"✏️ ویرایش… {n}/{len(pairs)}\n✅ {ok}   ❌ {fail}",
+                                buttons=stop_kb)
+            except Exception:
+                pass
+        await asyncio.sleep(0.15)
+    it["text"] = new_text
+    _bc_sent_save(d)
+    await prog.edit(
+        f"{'⏹ متوقف شد' if room.get('abort') else '✅ ویرایش تمام شد'}\n"
+        f"✏️ موفق: {ok}   ❌ ناموفق: {fail}\n\n"
+        "(ناموفق‌ها یعنی کاربر پیام را پاک کرده یا ربات را بلاک کرده است.)",
+        buttons=[[Button.inline("🔙 منوی پیام‌رسانی", b"bcr:menu")]])
+
+
+async def _bc_apply_delete(chat):
+    """حذف پیام‌های ارسال‌شده از چت همهٔ کاربران."""
+    d = _bc_sent_load()
+    items = d.get("items") or []
+    if not items:
+        await client.send_message(chat, "❕هنوز ارسالی ثبت نشده.",
+                                  buttons=[[Button.inline("🔙 منو", b"bcr:menu")]])
+        return
+    it = items[0]
+    pairs = it.get("ids") or []
+    room = BC_ROOMS.setdefault(chat, {"rid": it.get("rid") or "-", "step": "done"})
+    room["abort"] = False
+    stop_kb = [[Button.inline("⏹ توقف", b"bcr:stop")]]
+    prog = await client.send_message(chat, f"🗑 حذف {len(pairs)} پیام…", buttons=stop_kb)
+    ok = fail = 0
+    for n, pair in enumerate(pairs, 1):
+        if room.get("abort"):
+            break
+        try:
+            uid, mid = int(pair[0]), int(pair[1])
+        except Exception:
+            continue
+        try:
+            await asyncio.wait_for(client.delete_messages(uid, [mid], revoke=True), timeout=60)
+            ok += 1
+        except Exception:
+            fail += 1
+        if n % 20 == 0 or n == len(pairs):
+            try:
+                await prog.edit(f"🗑 حذف… {n}/{len(pairs)}\n✅ {ok}   ❌ {fail}",
+                                buttons=stop_kb)
+            except Exception:
+                pass
+        await asyncio.sleep(0.15)
+    d["items"] = [x for x in items if x is not it]
+    _bc_sent_save(d)
+    await prog.edit(
+        f"{'⏹ متوقف شد' if room.get('abort') else '🗑 حذف تمام شد'}\n"
+        f"✅ موفق: {ok}   ❌ ناموفق: {fail}",
+        buttons=[[Button.inline("🔙 منوی پیام‌رسانی", b"bcr:menu")]])
+
+
+async def _bc_send(room, panel):
+    """ارسال نهایی با نوار پیشرفت، توقف، و ثبت شناسه‌ها برای ویرایش/حذف بعدی."""
+    from telethon.errors import FloodWaitError
+    chat = panel.chat_id
+    grp = room.get("grp") or "all"
+    targets = _bc_group_ids(grp)
+    text = (room.get("text") or "").strip()
+    media = room.get("media")
+    if media and not Path(str(media)).exists():
+        media = None
+        room["media"] = None
+    if not targets:
+        t, k = _bc_room_card(room)
+        await panel.edit("😕 برای این گروه هیچ گیرنده‌ای پیدا نشد.\n\n" + t, buttons=k)
+        return
+    total = len(targets)
+    room["step"] = "sending"
+    room["abort"] = False
+    _bc_rooms_save()
+    stop_kb = [[Button.inline("⏹ توقف", b"bcr:stop")]]
+    item = {"rid": room.get("rid"), "ts": time.time(),
+            "kind": ("media" if media else "text"), "text": text,
+            "media": (Path(str(media)).name if media else ""),
+            "group": grp, "ids": []}
+    ok = fail = 0
+    last_err = ""
+    try:
+        await panel.edit(f"📣 ارسال به {total} نفر شروع شد…", buttons=stop_kb)
+    except Exception:
+        pass
+    for n, uid in enumerate(targets, 1):
+        if room.get("abort"):
+            break
+        sent_id = None
+        for attempt in (1, 2):
+            try:
+                m = await asyncio.wait_for(
+                    client.send_message(uid, text or " ", file=media, link_preview=False),
+                    timeout=120)
+                sent_id = getattr(m, "id", None)
+                break
+            except FloodWaitError as fw:
+                w = min(int(getattr(fw, "seconds", 5) or 5), 45)
+                last_err = f"⚠️ محدودیت تلگرام؛ {w} ثانیه صبر…"
+                try:
+                    await panel.edit(f"📣 ارسال… {n}/{total}\n{last_err}", buttons=stop_kb)
+                except Exception:
+                    pass
+                await asyncio.sleep(w)
+            except asyncio.TimeoutError:
+                last_err = "⏱ تلگرام پاسخ نداد → رد شد"
+                break
+            except Exception as ex:
+                last_err = f"❌ {type(ex).__name__}"
+                break
+        if sent_id:
+            ok += 1
+            item["ids"].append([int(uid), int(sent_id)])
+        else:
+            fail += 1
+        if n % 10 == 0 or n == total:
+            try:
+                await panel.edit(f"📣 ارسال… {n}/{total}\n✅ {ok}   ❌ {fail}"
+                                 + (f"\n{last_err}" if last_err else ""), buttons=stop_kb)
+            except Exception:
+                pass
+        await asyncio.sleep(0.4)
+    item["ids"] = item["ids"][:BC_SENT_MAX]
+    if item["ids"]:
+        _bc_sent_push(item)
+    room["step"] = "done"
+    room["sent_ok"], room["sent_fail"] = ok, fail
+    _bc_rooms_save()
+    _, k = _bc_room_card(room)
+    summary = (f"{'⏹ متوقف شد' if room.get('abort') else '✅ ارسال تمام شد'}\n\n"
+               f"👥 کل: {total}   ✅ موفق: {ok}   ❌ ناموفق: {fail}\n"
+               "(ناموفق‌ها معمولاً کسانی‌اند که ربات را بلاک کرده‌اند.)\n\n"
+               "می‌توانی همین حالا ویرایش یا حذف کنی:")
+    try:
+        await panel.edit(summary, buttons=k)
+    except Exception:
+        await client.send_message(chat, summary, buttons=k)
+
+
+async def _bc_room_capture(e):
+    if not getattr(e, "is_private", False):
+        return
+    if getattr(e, "out", False):
+        return
+    if e.sender_id not in ADMIN_IDS:
+        return
+    room = BC_ROOMS.get(e.chat_id)
+    if not room:
+        return
+    step = room.get("step")
+    if step not in ("content", "edittext", "editsent", "targets", "review"):
+        return
+    raw = (e.raw_text or "").strip()
+    if raw.startswith("/"):
+        return                                      # دستورها آزاد بمانند
+    # بقیهٔ اجزای همان آلبوم را نادیده بگیر (فقط اولین جزء محتوا می‌شود)
+    gid = getattr(e.message, "grouped_id", None)
+    if gid and room.get("gid") and gid == room["gid"]:
+        raise events.StopPropagation
+    has_media = bool(e.message.document or e.message.photo)
+    step_would_update = step in ("targets", "review")
+    if step_would_update:
+        step = "content"                            # محتوای تازه جای قبلی را می‌گیرد
+    if step == "content":
+        media = None
+        if has_media:
+            try:
+                media = await e.message.download_media(file="/tmp/bcroom_")
+            except Exception as ex:
+                await e.reply(f"❌ رسانه دریافت نشد: {str(ex)[:120]}")
+                raise events.StopPropagation
+        if not raw and not media:
+            await e.reply("⚠️ این پیام محتوا ندارد؛ یک متن یا فایل بفرست.")
+            raise events.StopPropagation
+        old = room.get("media")
+        if old and old != media:
+            try:
+                Path(str(old)).unlink(missing_ok=True)
+            except Exception:
+                pass
+        room.update({"text": raw, "media": media, "step": "targets", "gid": gid})
+        _bc_rooms_save()
+        await _bc_show_room(e.chat_id, room,
+                            ("🔄 محتوا به‌روزرسانی شد." if step_would_update else "✅ محتوا ثبت شد."))
+        raise events.StopPropagation
+    if step == "edittext":
+        if not raw:
+            await e.reply("⚠️ متن خالی است؛ متن تازه را بفرست.")
+            raise events.StopPropagation
+        room["text"] = raw
+        room["step"] = ("review" if room.get("grp") else "targets")
+        _bc_rooms_save()
+        await _bc_show_room(e.chat_id, room, "✅ متن ویرایش شد.")
+        raise events.StopPropagation
+    if step == "editsent":
+        if not raw:
+            await e.reply("⚠️ متن خالی است؛ متن تازه را بفرست.")
+            raise events.StopPropagation
+        room["step"] = "done"
+        _bc_rooms_save()
+        await _bc_apply_edit(e.chat_id, raw)
+        raise events.StopPropagation
+
+
+@client.on(events.NewMessage(pattern=r"^(?:/(?:bc|bcast|broadcast)(?:@\w+)?\b|📣 پیام همگانی)"))
+async def bc_start(e):
+    """میان‌بُر متنی (اختیاری): /bc هم فقط اتاق را باز می‌کند."""
+    if e.sender_id not in ADMIN_IDS or not e.is_private:
+        return
+    room = _bc_new_room(e.chat_id)
+    pre = ""
+    if e.text and len(e.text.split(None, 1)) > 1:
+        pre = e.text.split(None, 1)[1].strip()
+    if pre:
+        room["text"] = pre
+        room["step"] = "targets"
+    await _bc_show_room(e.chat_id, room)
+    raise events.StopPropagation
+
+
+@client.on(events.CallbackQuery(pattern=r"^bcr:"))
+async def bc_room_cb(e):
+    if e.sender_id not in ADMIN_IDS:
+        await e.answer("فقط مدیر می‌تواند.", alert=True)
+        return
+    chat = e.chat_id
+    data = e.data.decode("utf-8", "ignore")
+    room = BC_ROOMS.get(chat)
+
+    async def _render(note=""):
+        if not room:
+            t, k = _bc_intro_card()
+        else:
+            t, k = _bc_room_card(room)
+            if note:
+                t = f"{note}\n\n{t}"
+        try:
+            await e.edit(t, buttons=k)
+        except Exception:
+            await client.send_message(chat, t, buttons=k)
+
+    try:
+        await e.answer()
+    except Exception:
+        pass
+
+    if data == "bcr:menu":
+        t, k = _bc_intro_card()
+        await e.edit(t, buttons=k)
+        return
+
+    if data == "bcr:new":
+        room = _bc_new_room(chat)
+        await _render()
+        return
+
+    if data == "bcr:cancel":
+        old = BC_ROOMS.pop(chat, None)
+        if old and old.get("media"):
+            try:
+                Path(str(old["media"])).unlink(missing_ok=True)
+            except Exception:
+                pass
+        _bc_rooms_save()
+        room = None
+        try:
+            await e.edit("❌ از اتاق پیام‌رسانی خارج شدی. هیچ‌چیزی ارسال نشد.",
+                         buttons=[[Button.inline("🔙 منوی پیام‌رسانی", b"bcr:menu")]])
+        except Exception:
+            await client.send_message(chat, "❌ از اتاق خارج شدی.",
+                                      buttons=[[Button.inline("🔙 منو", b"bcr:menu")]])
+        return
+
+    if not room:
+        t, k = _bc_intro_card()
+        await e.edit("⌛ این اتاق بسته شده. یک اتاق تازه بساز:\n\n" + t, buttons=k)
+        return
+
+    if data == "bcr:grp":
+        room["step"] = "targets"
+        _bc_rooms_save()
+        await _render()
+        return
+
+    if data.startswith("bcr:g:"):
+        key = data.split(":", 2)[2]
+        if key not in dict(BC_GROUP_LABELS):
+            return
+        room["grp"] = key
+        room["step"] = "review"
+        _bc_rooms_save()
+        await _render()
+        return
+
+    if data == "bcr:edit":
+        room["step"] = "edittext"
+        _bc_rooms_save()
+        await _render()
+        return
+
+    if data == "bcr:back":
+        room["step"] = ("review" if room.get("grp") else "targets")
+        _bc_rooms_save()
+        await _render()
+        return
+
+    if data == "bcr:go":
+        if not room.get("grp"):
+            await e.answer("اول گروه گیرنده را انتخاب کن.", alert=True)
+            return
+        room["step"] = "sending"
+        _bc_rooms_save()
+        await _bc_send(room, e.message)
+        return
+
+    if data == "bcr:stop":
+        room["abort"] = True
+        return
+
+    if data == "bcr:editlast":
+        if not (_bc_sent_load().get("items") or []):
+            await e.answer("ارسالی برای ویرایش نیست.", alert=True)
+            return
+        room["step"] = "editsent"
+        _bc_rooms_save()
+        await _render()
+        return
+
+    if data == "bcr:dellast":
+        items = (_bc_sent_load().get("items") or [])
+        if not items:
+            await e.answer("ارسالی برای حذف نیست.", alert=True)
+            return
+        cnt = len(items[0].get("ids") or [])
+        try:
+            await e.edit(f"🗑 حذف پیام از چت **{cnt} نفر**؟\n\n"
+                         "این کار برگشت‌پذیر نیست.",
+                         buttons=[[Button.inline("🗑 بله، حذف کن", b"bcr:delok")],
+                                  [Button.inline("🔙 انصراف", b"bcr:menu")]])
+        except Exception:
+            pass
+        return
+
+    if data == "bcr:delok":
+        await _bc_apply_delete(chat)
+        return
 
 
 async def _big_ingest_download(orig_msg, st):
@@ -10305,215 +11002,6 @@ async def _big_ingest_download(orig_msg, st):
                 await client.delete_messages(chat, fwd_ids)
             except Exception:
                 pass
-
-
-async def bc_intro(chat_id):
-    """صفحهٔ شروعِ «پیام به کاربران» از داخل پنل مدیریت."""
-    txt = ("📣 پیام به کاربران\n\n"
-           "۱) متن/عکس/فایل نهایی‌ات را **همین‌جا** بفرست یا فوروارد کن.\n"
-           "۲) بعد دکمهٔ «✅ آخرین پیامم را بگیر» را بزن تا فهرست گیرنده‌ها بیاید.\n\n"
-           "💡 هرچه در آن پیام باشد (متن + رسانه) عیناً برای کاربران می‌رود.")
-    await client.send_message(
-        chat_id, txt, link_preview=False,
-        buttons=[[Button.inline("✅ آخرین پیامم را بگیر", b"bc:pick")],
-                 [Button.inline("✖ بستن", b"bc:close")]])
-
-
-async def _bc_pick(e):
-    """آخرین پیام محتوадار مدیر را گرفته، منوی انتخاب گیرنده را باز می‌کند."""
-    chat, admin = e.chat_id, e.sender_id
-    try:
-        msgs = await client.get_messages(chat, limit=8)
-    except Exception as ex:
-        await e.answer(f"خطا در خواندن پیام‌ها: {str(ex)[:60]}", alert=True); return
-    src = None
-    for m in msgs:
-        if m.id == e.message.id or getattr(m, "sender_id", None) != admin:
-            continue
-        if m.text or m.document or m.photo:
-            src = m; break
-    if src is None:
-        await e.answer("اول پیامِ تبلیغ را همین‌جا بفرست، بعد این دکمه را بزن.", alert=True); return
-    txt = (src.raw_text or src.text or "").strip() if src.text else ""
-    media_path = None
-    if src.document or src.photo:
-        try:
-            media_path = await src.download_media(file=f"/tmp/bc_{int(time.time())}")
-        except Exception as ex:
-            await e.answer(f"رسانه خوانده نشد: {str(ex)[:60]}", alert=True); return
-    targets = _bc_targets()
-    if not targets:
-        await e.answer("هنوز کاربری برای دریافت ثبت نشده است.", alert=True); return
-    old = BCAST.pop(chat, None)
-    if old:
-        _bc_cleanup(old)
-    st = {"text": txt, "media": media_path, "sel": None,
-          "ids": [u for u, _ in targets], "names": dict(targets), "msg": e.message.id}
-    BCAST[chat] = st
-    t, k = _bc_menu(st)
-    await e.edit(t, buttons=k)
-
-@client.on(events.NewMessage(pattern=r"^(?:/(?:bc|bcast|broadcast)(?:@\w+)?\b|📣 پیام همگانی)"))
-async def bc_start(e):
-    if e.sender_id not in ADMIN_IDS or not e.is_private:
-        return
-    reply = await e.get_reply_message() if e.reply_to_msg_id else None
-    # ── متن پیام ──
-    txt = ""
-    if reply and reply.text:
-        txt = (reply.raw_text or reply.text or "").strip()
-    elif e.text and len(e.text.split(None, 1)) > 1:
-        txt = e.text.split(None, 1)[1].strip()
-    # ── رسانهٔ ضمیمه ──
-    own_media = e.message.document or e.message.photo
-    rep_media = bool(reply and (reply.document or reply.photo))
-    has_media = bool(own_media or rep_media)
-    media_src = e.message if own_media else (reply if rep_media else None)
-    if not txt and not has_media:
-        await e.reply(
-            "📣 راهنمای پیام همگانی:\n\n"
-            "۱) متن/عکس/ویدیوی نهایی‌ات را بفرست و رویش ریپلای کن `/bc`\n"
-            "   یا مستقیم بنویس: `/bc متن پیام…`\n"
-            "۲) بعد با دکمه‌ها گیرنده‌ها را تیک بزن و «📤 ارسال» را بزن.\n\n"
-            "💡 بهترین روش: متن و فایل را **یک‌جا** در سیو مسیج آماده کن و رویش /bc بزن؛\n"
-            "هرچه آنجا هست (متن + مدیا) عیناً برای کاربران می‌رود.")
-        raise events.StopPropagation
-    media_path = None
-    if has_media and media_src is not None:
-        try:
-            media_path = await media_src.download_media(file=f"/tmp/bc_{int(time.time())}")
-        except Exception as ex:
-            await e.reply(f"❌ دریافت رسانه ناموفق بود: {str(ex)[:120]}")
-            raise events.StopPropagation
-    targets = _bc_targets()
-    if not targets:
-        if media_path:
-            try:
-                Path(media_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-        await e.reply("😕 هنوز کاربری ثبت نشده که پیام بگیرد؛ وقتی چند نفر از ربات استفاده کنند اینجا پر می‌شود.")
-        raise events.StopPropagation
-    old = BCAST.pop(e.chat_id, None)
-    if old:
-        _bc_cleanup(old)
-    st = {"text": txt, "media": media_path, "sel": None,
-          "ids": [u for u, _ in targets], "names": dict(targets), "msg": None}
-    BCAST[e.chat_id] = st
-    menu_txt, kb = _bc_menu(st)
-    m = await e.reply(menu_txt, buttons=kb, link_preview=False)
-    st["msg"] = m.id
-    raise events.StopPropagation
-
-
-@client.on(events.CallbackQuery(pattern=r"^bc:"))
-async def bc_cb(e):
-    if e.sender_id not in ADMIN_IDS:
-        await e.answer("فقط مدیر می‌تواند.", alert=True)
-        return
-    raw = e.data.decode("utf-8", "ignore")
-    if raw == "bc:close":
-        await e.edit("👌 بسته شد.", buttons=[])
-        return
-    if raw == "bc:pick":
-        await _bc_pick(e)
-        return
-    st = BCAST.get(e.chat_id)
-    if not st:
-        await e.edit("⏳ این منو منقضی شده؛ دوباره /bc را بزن.", buttons=[])
-        return
-    data = e.data.decode("utf-8", "ignore")
-    ids, sel = st["ids"], st["sel"]
-
-    if data == "bc:cancel":
-        BCAST.pop(e.chat_id, None)
-        _bc_cleanup(st)
-        await e.edit("✖ ارسال همگانی لغو شد.", buttons=[])
-        return
-
-    if data == "bc:all":
-        st["sel"] = None
-        await e.answer()
-        t, k = _bc_menu(st)
-        await e.edit(t, buttons=k)
-        return
-
-    if data.startswith("bc:t:"):
-        try:
-            uid = int(data.split(":")[2])
-        except (ValueError, IndexError):
-            await e.answer(); return
-        cur = set(ids) if sel is None else set(sel)     # اولین دست‌کاری = «همه منهای این فرد»
-        cur ^= {uid}
-        st["sel"] = None if len(cur) == len(ids) else cur
-        await e.answer()
-        t, k = _bc_menu(st)
-        await e.edit(t, buttons=k)
-        return
-
-    if data == "bc:go":
-        targets = ids if sel is None else [u for u in ids if u in sel]
-        if not targets:
-            await e.answer("هیچ گیرنده‌ای انتخاب نشده!", alert=True)
-            return
-        await e.answer("ارسال شروع شد…")
-        BCAST.pop(e.chat_id, None)                      # جلوگیری از اجرای دوباره
-        from telethon.errors import FloodWaitError
-        ok = fail = 0
-        total = len(targets)
-        base_text = st.get("text") or None
-        media = st.get("media")
-        names = st.get("names", {})
-        c_chat, c_msg = e.chat_id, st["msg"]
-
-        async def _edit(txt):
-            try:
-                await client.edit_message(c_chat, c_msg, txt[:4000])
-            except Exception:
-                pass
-
-        await _edit(f"📣 شروع ارسال به {total} نفر…")
-        for n, uid in enumerate(targets, 1):
-            label = names.get(uid, str(uid))
-            head = (f"📣 در حال ارسال… {n}/{total}\n"
-                    f"✅ موفق: {ok}   ❌ ناموفق: {fail}")
-            sent = False
-            note = ""
-            for attempt in (1, 2):                     # حداکثر یک بار تلاش مجدد
-                try:
-                    # 🔧 تایم‌اوت سخت: اگر RPC تلگرام قفل کرد، تا ابد منتظر نمانیم
-                    await asyncio.wait_for(
-                        client.send_message(uid, base_text or " ", file=media,
-                                            link_preview=False),
-                        timeout=120)
-                    sent = True
-                    break
-                except FloodWaitError as fw:
-                    wait_s = min(int(getattr(fw, "seconds", 5) or 5), 45)
-                    note = f"⚠️ محدودیت موقت تلگرام؛ {wait_s} ثانیه صبر کردم…"
-                    await _edit(head + "\n" + note)
-                    await asyncio.sleep(wait_s)
-                except asyncio.TimeoutError:
-                    note = f"⏱ تلگرام برای «{label}» پاسخ نداد → رد شد"
-                    break
-                except Exception as ex:
-                    note = f"❌ {type(ex).__name__} برای «{label}»"
-                    break
-            if sent:
-                ok += 1
-                note = f"✅ برای «{label}» ارسال شد"
-            else:
-                fail += 1
-            await _edit(head + "\n" + note)
-            await asyncio.sleep(0.4)                   # فاصلهٔ ضداسپم
-        _bc_cleanup(st)
-        summary = (f"✅ پایان ارسال همگانی\n👥 کل: {total}   ✅ موفق: {ok}   ❌ ناموفق: {fail}\n"
-                   "(ناموفق‌ها معمولاً کسانی‌اند که ربات را بلاک کرده‌اند یا چت خصوصی‌شان بسته است.)")
-        try:
-            await client.edit_message(c_chat, c_msg, summary, buttons=[])
-        except Exception:
-            pass
-
 
 
 # ═══════════════ 🌐 کم‌حجم از لینک مستقیم (بدون محدودیت تلگرام/پرمیوم) ═══════════════
@@ -10861,6 +11349,84 @@ async def cmd_me(e):
     raise events.StopPropagation
 
 
+# ═══════════════ 🗜 بخش ایزولهٔ کم‌حجم‌سازی + 🏠 خروج سراسری ═══════════════
+CMP_TXT = ("🗜 بخش کم‌حجم‌سازی — باز شد ✅\n\n"
+           "حالا فایل / ویدیو / عکس / آهنگت را همین‌جا بفرست.\n\n"
+           "• برای بستن: «✖ خروج از بخش» یا دکمهٔ «🏠 منوی اصلی»\n"
+           "• تا وقتی این بخش را باز نکنی، فایل‌ها فشرده نمی‌شوند.\n"
+           "• راهنمای کامل: «📖 راهنما»")
+
+
+async def _open_compress(chat):
+    if not is_allowed_feat(chat, "compress"):
+        await client.send_message(
+            chat, _need_sub_reply(chat),
+            buttons=[[Button.inline("🔑 فعال‌سازی اشتراک", b"sub:start")]])
+        return False
+    flow[chat] = {"kind": "compress", "ts": time.time()}
+    await client.send_message(chat, CMP_TXT,
+                              buttons=[[Button.inline("✖ خروج از بخش", b"cmp:exit")]])
+    return True
+
+
+async def _go_home(chat):
+    flow.pop(chat, None)
+    try:
+        globals().get("BC_ROOMS", {}).pop(chat, None)
+    except Exception:
+        pass
+    try:
+        GOLD_SEARCH.pop(chat, None)
+    except Exception:
+        pass
+    await client.send_message(
+        chat, "🏠 برگشتی به منوی اصلی.\nهر بخش را با دکمهٔ خودش باز کن؛ "
+              "هر بخش هم دکمهٔ خروج خودش را دارد.",
+        buttons=kb_for(chat))
+
+
+@client.on(events.NewMessage(func=lambda e: e.is_private
+                             and (e.text or "").strip() in (BTN_COMP, "/compress")))
+async def btn_compress(e):
+    try:
+        await note_user(e)
+    except Exception:
+        pass
+    await _open_compress(e.chat_id)
+    raise events.StopPropagation
+
+
+@client.on(events.NewMessage(func=lambda e: e.is_private
+                             and (e.text or "").strip() in (BTN_HOME, "/home", "/exit")))
+async def btn_home(e):
+    try:
+        await note_user(e)
+    except Exception:
+        pass
+    await _go_home(e.chat_id)
+    raise events.StopPropagation
+
+
+@client.on(events.CallbackQuery(pattern=r"^(?:cmp|home):"))
+async def _cmp_home_cb(e):
+    data = e.data.decode("utf-8", "ignore")
+    try:
+        await e.answer()
+    except Exception:
+        pass
+    if data == "cmp:open":
+        await _open_compress(e.chat_id)
+    elif data == "cmp:exit":
+        flow.pop(e.chat_id, None)
+        try:
+            await e.edit("✖ از بخش کم‌حجم‌سازی خارج شدی.", buttons=None)
+        except Exception:
+            pass
+        await client.send_message(e.chat_id, "🏠 منوی اصلی 👇", buttons=kb_for(e.chat_id))
+    elif data == "home:open":
+        await _go_home(e.chat_id)
+
+
 @client.on(events.CallbackQuery(pattern=r"^me:"))
 async def me_cb(e):
     try:
@@ -10912,13 +11478,17 @@ async def adm_golds_list(e):
 # ═══════════════ ⚙️ کلیدهای فعال/غیرفعال کردن قابلیت‌ها ═══════════════
 FEAT_FILE = Path("/tmp/feat_flags.json")
 FEAT_NAMES = {
-    "compress": "🎬 کم‌حجم کردن",
-    "tag":      "🏷 تگ/تغییر نام",
+    "compress": "🗜 کم‌حجم کردن",
+    "tag":      "🏷 تگ / تغییر نام",
+    "dl":       "📥 کانال محدود (دانلود)",
     "ai":       "🤖 هوش مصنوعی",
+    "stt":      "🎙 ویس به متن",
+    "link":     "🔗 فایل به لینک",
     "yt":       "▶️ یوتیوب",
-    "dl":       "📥 دانلود از کانال",
-    "anten":    "📡 آنتن/پروکسی",
-    "finder":   "🔍 فایل‌یاب",
+    "insta":    "📸 اینستاگرام",
+    "bargh":    "⚡ برق کاشان",
+    "finder":   "🔎 مزاحم‌یاب",
+    "anten":    "📡 آنتن / پروکسی",
     "sd":       "📸 عکس خودمحو",
 }
 
@@ -10995,6 +11565,44 @@ async def ft_toggle(e):
 GOLD_SEARCH = {}   # chat(admin) → آخرین عبارت جستجو
 
 
+GS_PAGE_SIZE = 8            # تعداد کاربر در هر صفحهٔ فهرست
+GOLD_VIEW = {}              # chat(admin) → ("list", page) یا ("search", query)
+
+
+def _gold_page_card(page: int = 0):
+    """فهرست همهٔ کاربران با دکمهٔ فعال/غیرفعال — صفحه‌به‌صفحه + جستجو."""
+    users = _bc_targets()                       # بدون ادمین، پرکارترین‌ها اول
+    total = len(users)
+    pages = max((total + GS_PAGE_SIZE - 1) // GS_PAGE_SIZE, 1)
+    page = max(0, min(int(page), pages - 1))
+    chunk = users[page * GS_PAGE_SIZE:(page + 1) * GS_PAGE_SIZE]
+    gold_n = sum(1 for u, _ in users if is_gold(u))
+    lines = ["👑 مدیریت طلایی — فهرست کاربران",
+             f"👥 {total} کاربر  •  👑 {gold_n} طلایی",
+             f"📄 صفحهٔ {page + 1} از {pages}"]
+    if not chunk:
+        lines += ["", "😕 هنوز کاربری ثبت نشده (بعد از اولین استفاده پر می‌شود)."]
+    else:
+        lines += ["", "روی هر نام بزن → طلایی فعال/غیرفعال می‌شود. 🔄 = پروفایل کامل:"]
+    kb = []
+    for uid, name in chunk:
+        g = is_gold(uid)
+        lab = ("👑✅ " if g else "⚪➖ ") + name
+        kb.append([Button.inline(lab[:34], f"gset:{uid}:{0 if g else 1}".encode()),
+                   Button.inline("🔄", f"grfw:{uid}".encode())])
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("◀️ صفحهٔ قبل", f"glist:{page - 1}".encode()))
+    if page < pages - 1:
+        nav.append(Button.inline("صفحهٔ بعد ▶️", f"glist:{page + 1}".encode()))
+    if nav:
+        kb.append(nav)
+    kb.append([Button.inline("🔍 جستجو / فیلتر", b"gs:open"),
+               Button.inline("📊 آمار", b"a:gstats")])
+    kb.append([Button.inline("🔙 بازگشت به پنل", b"a:menu")])
+    return "\n".join(lines), kb
+
+
 def _gold_results(q: str):
     q = (q or "").strip()
     ql = q.lower()
@@ -11025,19 +11633,91 @@ def _gold_results(q: str):
         lab = ("👑✅ " if g else "⚪➖ ") + disp
         kb.append([Button.inline(lab, f"gset:{uid}:{0 if g else 1}".encode()),
                    Button.inline("🔄" , f"grfw:{uid}".encode())])
-    kb.append([Button.switch_inline("🔍 جستجوی جدید", "gfind ", same_peer=True)])
+    kb.append([Button.inline("🔍 جستجوی جدید", b"gs:open"),
+               Button.inline("👥 همهٔ کاربران", b"glist:0")])
+    kb.append([Button.inline("✖ بستن", b"gs:close")])
     return "\n".join(lines), kb
 
 
-@client.on(events.NewMessage(pattern=r"^(?:gfind |\/gsearch )(.+)$"))
+@client.on(events.CallbackQuery(pattern=r"^gs:"))
+async def gs_cb(e):
+    if e.sender_id not in ADMIN_IDS:
+        await e.answer("فقط مدیر.", alert=True)
+        return
+    data = e.data.decode("utf-8", "ignore")
+    try:
+        await e.answer()
+    except Exception:
+        pass
+    if data == "gs:open":
+        flow[e.chat_id] = {"kind": "goldsearch", "ts": time.time()}
+        await client.send_message(
+            e.chat_id,
+            "🔍 جستجوی کاربر\n\nاسم، @یوزرنیم یا آیدی عددی را همین‌جا بنویس و بفرست.\n"
+            "بعد با یک ضربه روی نتیجه، طلایی را فعال/غیرفعال کن؛ 🔄 = پروفایل کامل.\n\n"
+            "برای خروج: «✖ بستن» یا «🏠 منوی اصلی»",
+            buttons=[[Button.inline("✖ بستن", b"gs:close")]])
+    elif data == "gs:close":
+        flow.pop(e.chat_id, None)
+        try:
+            await e.edit("❌ جستجو بسته شد.",
+                         buttons=[[Button.inline("🔙 مدیریت طلایی", b"a:gold")]])
+        except Exception:
+            pass
+
+
+@client.on(events.NewMessage(pattern=r"^(?:(?:@\w+)\s+)?(?:gfind|/gsearch)(?:\s+|$)(.+)$"))
 async def adm_gsearch(e):
     if e.sender_id not in ADMIN_IDS or not e.is_private:
         raise events.StopPropagation
     q = e.pattern_match.group(1).strip()
     GOLD_SEARCH[e.chat_id] = q
+    GOLD_VIEW[e.chat_id] = ("search", q)
     t, k = _gold_results(q)
     await e.reply(t, buttons=k)
     raise events.StopPropagation
+
+
+async def _redraw_gold(chat, keep_query=None, e=None):
+    """کارت طلایی را با همان حالتی که مدیر در آن بود بازترسیم می‌کند (فهرست/جستجو)."""
+    mode, val = GOLD_VIEW.get(chat, ("list", 0))
+    if keep_query is not None:
+        mode, val = "search", keep_query
+    if mode == "list":
+        t, k = _gold_page_card(val)
+    else:
+        t, k = _gold_results(val)
+    if e is not None:
+        try:
+            await e.edit(t, buttons=k)
+            return
+        except Exception:
+            pass
+    try:
+        await client.send_message(chat, t, buttons=k)
+    except Exception:
+        pass
+
+
+@client.on(events.CallbackQuery(pattern=r"^glist:"))
+async def glist_cb(e):
+    if e.sender_id not in ADMIN_IDS:
+        await e.answer("فقط مدیر.", alert=True)
+        return
+    try:
+        page = int(e.data.decode().split(":")[1])
+    except Exception:
+        page = 0
+    GOLD_VIEW[e.chat_id] = ("list", page)
+    try:
+        await e.answer()
+    except Exception:
+        pass
+    t, k = _gold_page_card(page)
+    try:
+        await e.edit(t, buttons=k)
+    except Exception:
+        await client.send_message(e.chat_id, t, buttons=k)
 
 
 @client.on(events.CallbackQuery(pattern=r"^gset:"))
@@ -11048,12 +11728,7 @@ async def gset_cb(e):
     uid = int(uid_s)
     _set_gold(uid, want == "1", by="admin")
     await e.answer(("👑 طلایی فعال شد" if want == "1" else "⚪ طلایی غیرفعال شد") + f" — {uid}")
-    q = GOLD_SEARCH.get(e.chat_id, "")
-    t, k = _gold_results(q or str(uid))
-    try:
-        await e.edit(t, buttons=k)
-    except Exception:
-        pass
+    await _redraw_gold(e.chat_id, None, e)
 
 
 @client.on(events.CallbackQuery(pattern=r"^grfw:"))
@@ -11077,6 +11752,10 @@ async def btn_bargh(e):
 
 
 async def bargha_menu(e):
+    if not is_allowed_feat(e.chat_id, "bargh"):
+        await e.reply(_need_sub_reply(e.chat_id),
+                      buttons=[[Button.inline("🔑 فعال‌سازی اشتراک", b"sub:start")]])
+        return
     regs = bargha.regions.get(str(e.chat_id), [])
     txt = ("⚡ برق کاشان\n\n"
            "اطلاعیه‌های خاموشی برق کاشان رو رصد می‌کنم؛ اگه منطقه‌ات توش باشه خبرت می‌کنم"
@@ -11629,12 +12308,17 @@ SUBS = {"lock_all": False, "keys": {}, "allowed": {}, "perms": {}}
 # perms: {chat_id: {ویژگی: bool}} — محدودیت تک‌تک امکانات هر کاربر
 FEATS = [
     ("compress", "🗜 کم‌حجم‌کردن"),
-    ("anten", "📡 آنتن"),
-    ("sd", "📸 عکس خودمحو"),
+    ("tag", "🏷 تگ فایل"),
+    ("dl", "📥 کانال محدود"),
     ("ai", "🤖 هوش مصنوعی"),
+    ("stt", "🎙 ویس به متن"),
+    ("link", "🔗 فایل به لینک"),
     ("yt", "🎬 یوتیوب"),
+    ("insta", "📸 اینستاگرام"),
     ("bargh", "⚡ برق کاشان"),
     ("finder", "🔎 مزاحم‌یاب"),
+    ("anten", "📡 آنتن"),
+    ("sd", "📸 عکس خودمحو"),
 ]
 
 
@@ -12474,6 +13158,10 @@ def main():
     load_group_cfg()
     load_sources()
     load_subs()
+    try:
+        _bc_rooms_load()
+    except Exception:
+        pass
     load_sd_settings()
     bargha.on_announcement = announce_to_group
     # اگر هیچ داده‌ای نیست، راهنمای یک‌قدمی به مدیر
