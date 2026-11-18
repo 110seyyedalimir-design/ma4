@@ -90,11 +90,40 @@ BOT_VERSION = "v25.49.0"
 #    خوش‌آمدگویی، ساعت زنده، اکشن‌های نمایشی، برودکست
 # برای فعال‌سازی دستیار بعداً: Variables اسپیس → AGENT_ENABLED = 1
 # ══════════════════════════════════════════════════════════════════
-USERBOT_ENABLED = os.environ.get("USERBOT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
-AGENT_ENABLED = os.environ.get("AGENT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+def _env_flag(name: str, default: bool = False) -> bool:
+    """پرچم‌های محیطی با احترام به «متغیر خالی».
+    اگر متغیر در GitHub Actions تعریف نشده باشد، مقدارش '' می‌شود؛
+    قبلاً همین باعث می‌شد پیش‌فرضِ روشن هم خاموش حساب شود."""
+    v = (os.environ.get(name) or "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "on", "بله", "روشن")
+
+
+def _runtime_flag_load():
+    """پرچم‌هایی که مدیر از داخل ربات عوض می‌کند (بر /tmp و بکاپ)."""
+    try:
+        return json.loads(Path("/tmp/runtime_flags.json").read_text()) or {}
+    except Exception:
+        return {}
+
+
+def _runtime_flag_set(key: str, val):
+    try:
+        d = _runtime_flag_load()
+        d[key] = bool(val)
+        Path("/tmp/runtime_flags.json").write_text(json.dumps(d), encoding="utf-8")
+        persist.mark_dirty()
+    except Exception:
+        pass
+
+
+_RT = _runtime_flag_load()
+USERBOT_ENABLED = bool(_RT.get("userbot", _env_flag("USERBOT_ENABLED", True)))
+AGENT_ENABLED = _env_flag("AGENT_ENABLED", False)
 # ۳) SDSEND_ENABLED (پیش‌فرض روشن!) — فقط «ارسال خودموف به دیگران» (/sdto)
 #    مستقل از دستیار: حتی وقتی AGENT_ENABLED=0 است، /sdto کار می‌کند
-SDSEND_ENABLED = os.environ.get("SDSEND_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+SDSEND_ENABLED = _env_flag("SDSEND_ENABLED", True)
 API_ID = int(os.environ.get("TG_API_ID", "0") or 0)
 API_HASH = os.environ.get("TG_API_HASH", "").strip()
 ADMIN_IDS = {
@@ -213,6 +242,7 @@ FFMPEG_STALL_S = 180                  # اگر ffmpeg این‌قدر ثانیه
 STALL_RECV_S   = 600                  # دریافت: بیش از این بدون پیشرفت → خطای روشن
 STALL_SEND_S   = 900                  # ارسال نتیجه: مهلت بیشتر برای فایل بزرگ/خط کند
 BIG_FILE_MAX   = 3_900_000_000        # بالاترین حد تلگرام (با اکانت پرمیوم ≈۴ گیگ)
+BOT_DL_MAX     = 19_000_000           # سقف دانلود «ربات» در تلگرام ≈۲۰ مگابایت
 BOT_UNAME = ""                     # یوزرنیم بات برای لینک دعوت؛ هنگام شروع پر می‌شود
 SPLIT_THRESHOLD= 1_900_000_000        # خروجی بزرگ‌تر از این خودکار قسمت می‌شود
 TAG_BIG        = {}                    # چت‌هایی که تگِ فایل >۲ گیگ در جریان دارند
@@ -9375,6 +9405,9 @@ async def on_admin_cb(e):
             "همین‌جا می‌پرسد — پیام پسورد بلافاصله از چت پاک می‌شود.",
             [[Button.inline("🔗 اتصال / لاگین", b"a:login2")] if not _conn
              else Button.inline("🔌 قطع اتصال و پاک‌کردن نشست", b"a:logout2")],
+            [Button.inline("🔴 خاموش کردن اکانت‌خوان" if USERBOT_ENABLED
+                           else "🟢 روشن کردن اکانت‌خوان",
+                           b"ub:off" if USERBOT_ENABLED else b"ub:on")],
             [[Button.inline("🔐 امنیت نشست‌ها", b"a:sec")],
              [Button.inline("🔙 بازگشت", b"a:menu")]])
         return
@@ -10182,9 +10215,22 @@ async def on_file(e):
     if size > BIG_FILE_MAX:
         await e.reply("❌ تلگرام حتی با اکانت پرمیوم هم بالاتر از ~۴ گیگابایت را منتقل نمی‌کند.")
         return
-    USE_BIG = size > ACCEPT_MAX
+    # ربات (نشست ربات) در تلگرام فقط تا ~۲۰ مگابایت می‌تواند دانلود کند؛
+    # پس هر فایل بزرگ‌تر باید از مسیر «گروه کمکی + اکانت‌خوان» برود.
+    _uc_ok = bool(globals().get("user_client") and user_client.is_connected())
+    _grp_ok = bool((((GROUP_CFG or {}).get("media") or {}).get("chat")))
+    USE_BIG = size > ACCEPT_MAX or (size > BOT_DL_MAX and _uc_ok and _grp_ok)
+    if size > BOT_DL_MAX and not USE_BIG:
+        await e.reply(
+            "⚠️ این فایل از سقف دانلودِ ربات در تلگرام (~۲۰ مگابایت) بزرگ‌تر است.\n\n"
+            "دو راه:\n"
+            "① مدیر `/login` بزند و اکانت‌خوان را وصل کند، و گروه کمکی هم تنظیم باشد "
+            "(بعد از آن هر حجمی تا ۴ گیگ از همین‌جا پذیرفته می‌شود)؛\n"
+            "② یا فایل را جایی آپلود کن و لینک بده: `/zlink https://…`",
+            buttons=[[Button.inline("🔗 راهنمای اتصال اکانت", b"help:reader")],
+                     [Button.inline("🌐 روش لینک", b"help:zlink")]])
+        return
     if USE_BIG:
-        _uc_ok = bool(globals().get("user_client") and user_client.is_connected())
         if not _uc_ok:
             await e.reply("⚠️ فایل بالای ~۲ گیگ فقط وقتی پردازش می‌شود که «اکانت‌خوان» وصل باشد (رایگان هم کافیست؛ پرمیوم فقط سریع‌تر).\n"
                           "① مدیر `/login` را بزند و یک اکانت وصل کند؛\n"
@@ -11409,12 +11455,39 @@ async def _big_ingest_download(orig_msg, st):
     uc = globals().get("user_client")
     if not chat or not (uc and uc.is_connected()):
         raise RuntimeError("برای فایل بالای ۲ گیگ، «اکانت‌خوان» وصل + تنظیم گروه لازم است.")
+    if chat > 0:                       # شناسهٔ گروه بدون -100 ذخیره شده باشد
+        chat = int(f"-100{chat}")
     fwd_ids = None
     try:
         fwd = await client.forward_messages(chat, [orig_msg], top_msg_id=topic)
+        if not isinstance(fwd, (list, tuple)):
+            fwd = [fwd]
         fwd_ids = [m.id for m in fwd]
+
+        # ⚠️ نکتهٔ مهم (باگ «Invalid channel object»):
+        # پیامی که ربات فوروارد کرده، مالِ نشستِ ربات است. access_hash و
+        # file_reference هر اکانت جداست؛ اگر همان شیء را به اکانت‌خوان بدهیم،
+        # تلگرام CHANNEL_INVALID می‌دهد. پس اکانت‌خوان باید پیام را با
+        # نشستِ خودش از گروه بخواند و همان را دانلود کند.
+        uc_msg = None
+        try:
+            uc_msg = await uc.get_messages(chat, ids=fwd_ids[0])
+        except Exception as _ex1:
+            log.warning("big_ingest: get_messages(chat) failed: %s", _ex1)
+        if not uc_msg or not getattr(uc_msg, "media", None):
+            try:
+                ent = await uc.get_entity(chat)
+                uc_msg = await uc.get_messages(ent, ids=fwd_ids[0])
+            except Exception as _ex2:
+                log.warning("big_ingest: get_messages(entity) failed: %s", _ex2)
+        if not uc_msg or not getattr(uc_msg, "media", None):
+            raise RuntimeError(
+                "اکانت‌خوان نتوانست نسخهٔ کمکی را در گروه ببیند.\n"
+                "① مطمئن شو همان اکانتی که /login شده، **عضوِ** گروه کمکی است؛\n"
+                "② یا در «🗂 رسانه/گروه» شناسهٔ درست گروه را تنظیم کن."
+            )
         path = await uc.download_media(
-            fwd[0], file=str(WORKDIR),
+            uc_msg, file=str(WORKDIR),
             progress_callback=lambda c, t: st.update(cur=c, total=t))
         if not path:
             raise RuntimeError("دانلود نسخهٔ کمکی ناموفق بود — اتصال اکانت‌خوان را بررسی کن (برای دانلود، اکانت رایگان هم مجاز است).")
@@ -11640,6 +11713,12 @@ def _gu(d, uid):
 
 
 def is_gold(uid) -> bool:
+    """مدیرها همیشه طلایی‌اند (نیازی به سه رفرال / فعال‌سازی دستی ندارند)."""
+    try:
+        if int(uid) in ADMIN_IDS:
+            return True
+    except Exception:
+        pass
     try:
         return bool((_gold_load().get(str(uid)) or {}).get("gold"))
     except Exception:
@@ -12555,7 +12634,11 @@ SESSION_FILE = Path("/tmp/user_session.json")
 @client.on(events.NewMessage(pattern=r"^/login$"))
 async def cmd_login(e):
     if not USERBOT_ENABLED:
-        await e.reply("🔴 حالت اکانت‌خوان فعلاً خاموش است.")
+        await e.reply(
+            "🔴 حالت اکانت‌خوان خاموش است.\n\n"
+            "دلیل: متغیر `USERBOT_ENABLED` در GitHub یا پرچم داخلی ربات خاموش است.\n"
+            "با دکمهٔ زیر همین‌جا روشنش کن (بدون تغییر در گیت‌هاب):",
+            buttons=[[Button.inline("🟢 روشن کن و ادامه بده", b"ub:on")]])
         return
     if e.sender_id not in ADMIN_IDS:
         return
@@ -12570,6 +12653,57 @@ async def cmd_login(e):
                   "🛡 شماره/کد/پسورد بعد از استفاده از چت پاک می‌شوند.\n"
                   "انصراف: «✖ خروج از بخش» یا /cancel",
                   buttons=room_kb())
+
+
+@client.on(events.NewMessage(pattern=r"^/(?:userbot|reader)(?:\s+(on|off|1|0|روشن|خاموش))?$"))
+async def cmd_userbot(e):
+    if e.sender_id not in ADMIN_IDS:
+        return
+    global USERBOT_ENABLED
+    arg = (e.pattern_match.group(1) or "").strip().lower()
+    if arg in ("on", "1", "روشن"):
+        USERBOT_ENABLED = True
+        _runtime_flag_set("userbot", True)
+    elif arg in ("off", "0", "خاموش"):
+        USERBOT_ENABLED = False
+        _runtime_flag_set("userbot", False)
+    st = ("🟢 روشن" if USERBOT_ENABLED else "🔴 خاموش")
+    con = "وصل ✅" if (user_client and user_client.is_connected()) else "قطع"
+    await e.reply(
+        f"👁 اکانت‌خوان: {st}\nاتصال: {con}\n\n"
+        "برای اتصال: /login\n"
+        "دستور: /userbot on | /userbot off",
+        buttons=[[Button.inline("🔴 خاموش کن" if USERBOT_ENABLED else "🟢 روشن کن",
+                                b"ub:off" if USERBOT_ENABLED else b"ub:on")],
+                 [Button.inline("🔗 لاگین", b"a:login2")]])
+    raise events.StopPropagation
+
+
+@client.on(events.CallbackQuery(pattern=r"^ub:"))
+async def ub_cb(e):
+    if e.sender_id not in ADMIN_IDS:
+        await e.answer("فقط مدیر.", alert=True)
+        return
+    global USERBOT_ENABLED
+    want = e.data.decode().endswith(":on")
+    USERBOT_ENABLED = want
+    _runtime_flag_set("userbot", want)
+    try:
+        await e.answer("🟢 روشن شد" if want else "🔴 خاموش شد")
+    except Exception:
+        pass
+    if want:
+        await client.send_message(
+            e.chat_id,
+            "🟢 اکانت‌خوان روشن شد. حالا اتصال را شروع کن:",
+            buttons=[[Button.inline("🔗 اتصال / لاگین", b"a:login2")],
+                     [Button.inline("🔙 پنل", b"a:menu")]])
+    else:
+        try:
+            await e.edit("🔴 اکانت‌خوان خاموش شد.",
+                         buttons=[[Button.inline("🟢 روشن کن", b"ub:on")]])
+        except Exception:
+            pass
 
 
 @client.on(events.NewMessage(pattern=r"^/logout$"))
