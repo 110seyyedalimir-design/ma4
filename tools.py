@@ -1669,11 +1669,44 @@ def _mp_fields(boundary, fields, files):
     return b"".join(parts)
 
 
+# ── سقف واقعی هر میزبان آپلود (بررسی‌شده) ────────────────────────────────
+GOFILE_MAX  = 2000 * 1024 * 1024     # gofile فایل‌های چند گیگی را هم قبول می‌کند
+FILEBIN_MAX = 1900 * 1024 * 1024     # همان چیزی که کد قبلی فرض می‌کرد (~۱٫۹ گیگ)
+CATBOX_MAX  = 200  * 1024 * 1024     # محدودیت رسمی catbox/litterbox — مهم!
+UGUU_MAX    = 256  * 1024 * 1024     # سقف تقریبی uguu
+
+
+def _have_curl() -> bool:
+    import shutil as _sh
+    return bool(_sh.which("curl"))
+
+
+def _curl_post(url, fields, file_field, file_path, timeout=1800, want_json=False):
+    """آپلود جریانی (بدون خواندن کل فایل در RAM) با curl سیستم."""
+    import subprocess as _sp
+    args = ["curl", "-sS", "--fail-with-body", "--max-time", str(timeout),
+            "--connect-timeout", "20", "--retry", "1",
+            "-A", UA["User-Agent"], "-X", "POST"]
+    for k, v in (fields or {}).items():
+        args += ["-F", f"{k}={v}"]
+    args += ["-F", f"{file_field}=@{file_path};type=application/octet-stream", url]
+    r = _sp.run(args, capture_output=True, text=True, timeout=timeout + 60)
+    if r.returncode != 0:
+        raise RuntimeError(f"آپلود قطع شد ({r.returncode}): {(r.stderr or '').strip()[-140:]}")
+    out = (r.stdout or "").strip()
+    if want_json:
+        try:
+            return json.loads(out or "{}")
+        except Exception:
+            raise RuntimeError(f"جواب نامعتبر بود: {out[:80]}")
+    return out
+
+
 def upload_gofile(path):
-    """فایل → لینک دائمی (gofile.io — بدون کلید)"""
-    import uuid as _uuid
-    with open(path, "rb") as f:
-        data = f.read(900_000_000)
+    """فایل → لینک دائمی (gofile.io) — جریانی، بدون بُریدن فایل."""
+    size = Path(path).stat().st_size
+    if size > GOFILE_MAX:
+        raise RuntimeError(f"gofile: فایل {size // 1024 ** 2}MB از سقف این میزبان بزرگ‌تر است")
     # سرور فعال را بگیر
     req = urllib.request.Request("https://api.gofile.io/servers", headers=UA)
     with urllib.request.urlopen(req, timeout=20) as r:
@@ -1681,14 +1714,21 @@ def upload_gofile(path):
     servers = (d.get("data") or {}).get("servers") or []
     if not servers:
         raise RuntimeError("سرور gofile در دسترس نیست")
-    server = servers[0]["name"]
-    b = "----gf" + _uuid.uuid4().hex
-    body = _mp_fields(b, {}, {"file": (Path(path).name, data, "application/octet-stream")})
-    req = urllib.request.Request(f"https://{server}.gofile.io/contents/uploadfile",
-                                 data=body, method="POST",
-                                 headers={**UA, "Content-Type": f"multipart/form-data; boundary={b}"})
-    with urllib.request.urlopen(req, timeout=600) as r:
-        d = json.loads(r.read().decode("utf-8", "ignore"))
+    url_api = f"https://{servers[0]['name']}.gofile.io/contents/uploadfile"
+    if _have_curl():                                  # مسیر اصلی: جریانی و مطمئن
+        d = _curl_post(url_api, {}, "file", path, timeout=1800, want_json=True)
+    else:                                             # fallback کم‌حجم (بدون curl)
+        if size > 900_000_000:
+            raise RuntimeError("gofile: بدون curl فقط تا ~۸۶۰MB")
+        import uuid as _uuid
+        with open(path, "rb") as f:
+            data = f.read(size)                       # دقیقاً به اندازهٔ فایل (نه بیشتر!)
+        b = "----gf" + _uuid.uuid4().hex
+        body = _mp_fields(b, {}, {"file": (Path(path).name, data, "application/octet-stream")})
+        rq = urllib.request.Request(url_api, data=body, method="POST",
+                                    headers={**UA, "Content-Type": f"multipart/form-data; boundary={b}"})
+        with urllib.request.urlopen(rq, timeout=1800) as r:
+            d = json.loads(r.read().decode("utf-8", "ignore"))
     url = ((d.get("data") or {}).get("downloadPage") or "")
     if d.get("status") != "ok" or not url:
         raise RuntimeError(f"gofile: {str(d)[:80]}")
@@ -1696,44 +1736,62 @@ def upload_gofile(path):
 
 
 def upload_litterbox(path, time_="72h"):
-    """فایل → لینک موقت (litterbox — ۷۲ ساعت)"""
-    import uuid as _uuid
-    with open(path, "rb") as f:
-        data = f.read(900_000_000)
-    b = "----lb" + _uuid.uuid4().hex
-    body = _mp_fields(b, {"reqtype": "fileupload", "time": time_},
-                      {"fileToUpload": (Path(path).name, data, "application/octet-stream")})
-    req = urllib.request.Request("https://litterbox.catbox.moe/resources/internals/api.php",
-                                 data=body, method="POST",
-                                 headers={**UA, "Content-Type": f"multipart/form-data; boundary={b}"})
-    with urllib.request.urlopen(req, timeout=600) as r:
-        url = r.read().decode().strip()
+    """فایل → لینک موقت (litterbox/catbox — ۷۲ ساعت، سقف رسمی ۲۰۰MB)"""
+    size = Path(path).stat().st_size
+    if size > CATBOX_MAX:
+        raise RuntimeError(f"litterbox: سقف این سرویس ۲۰۰MB است (فایل {size // 1024 ** 2}MB)")
+    LB_API = "https://litterbox.catbox.moe/resources/internals/api.php"
+    if _have_curl():
+        url = _curl_post(LB_API, {"reqtype": "fileupload", "time": time_},
+                         "fileToUpload", path, timeout=900)
+    else:
+        import uuid as _uuid
+        with open(path, "rb") as f:
+            data = f.read(size)
+        b = "----lb" + _uuid.uuid4().hex
+        body = _mp_fields(b, {"reqtype": "fileupload", "time": time_},
+                          {"fileToUpload": (Path(path).name, data, "application/octet-stream")})
+        req = urllib.request.Request(LB_API, data=body, method="POST",
+                                     headers={**UA, "Content-Type": f"multipart/form-data; boundary={b}"})
+        with urllib.request.urlopen(req, timeout=900) as r:
+            url = r.read().decode().strip()
+    url = (url or "").strip()
     if not url.startswith("http"):
         raise RuntimeError(f"litterbox: {url[:60]}")
     return url
 
 
 def upload_file_link(path):
-    """فایل → لینک — زنجیره: gofile (دائمی، بدون سقف) → filebin (۶روز، بدون سقف)
-    → litterbox (۷۲س) → uguu (۳س)
+    """فایل → لینک — زنجیرهٔ میزبان‌ها؛ هر کدام که سقفش به فایل بخورد امتحان می‌شود.
     خروجی: {"url":..., "kind": str}"""
-    try:
-        return {"url": upload_gofile(path), "kind": "دائمی"}
-    except Exception:
-        pass
-    try:
-        return {"url": upload_filebin(path), "kind": "۶ روزه"}
-    except Exception:
-        pass
-    try:
-        return {"url": upload_litterbox(path, "72h"), "kind": "۷۲ ساعته"}
-    except Exception:
-        pass
-    try:
-        return {"url": uguu_upload(path), "kind": "۳ ساعته"}
-    except Exception:
-        pass
-    raise RuntimeError("هیچ میزبان آپلودی جواب نداد — بعداً دوباره")
+    size = Path(path).stat().st_size
+
+    def _uguu_guarded(p):
+        if Path(p).stat().st_size > UGUU_MAX:
+            raise RuntimeError(f"uguu: سقف ~{UGUU_MAX // 1024 ** 2}MB")
+        return uguu_upload(p)
+
+    chain = [
+        (upload_gofile,      "دائمی",    "gofile (دائمی)",         GOFILE_MAX),
+        (upload_filebin,     "۶ روزه",   "filebin (۶ روز)",        FILEBIN_MAX),
+        (upload_litterbox,   "۷۲ ساعته", "litterbox (۷۲ ساعت)",    CATBOX_MAX),
+        (_uguu_guarded,      "۳ ساعته",  "uguu (۳ ساعت)",          UGUU_MAX),
+    ]
+    fails = []
+    for fn, kind, label, cap in chain:
+        if size > cap:
+            print(f"[link] ⤵️ «{label}» رد شد — سقفش {cap // 1024 ** 2}MB است "
+                  f"(فایل {size // 1024 ** 2}MB)", flush=True)
+            continue
+        try:
+            url = fn(path)
+            print(f"[link] ✅ لینک ساخته شد → {label}", flush=True)
+            return {"url": url, "kind": kind}
+        except Exception as ex:
+            fails.append(f"{label}: {str(ex)[:70]}")
+            print(f"[link] ❌ «{label}» ناموفق بود: {str(ex)[:90]}", flush=True)
+    raise RuntimeError("هیچ میزبان آپلودی جواب نداد:\n" + "\n".join(fails)[-350:] +
+                       "\n⏳ چند دقیقه دیگر دوباره /link بزن.")
 
 
 def audio_extract(path, out_ext="mp3", enhance=False):
