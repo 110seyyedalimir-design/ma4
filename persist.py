@@ -35,6 +35,9 @@ FILES = [
     "bargha_state.json",     # اطلاعیه‌ها + وضعیت
     "comp_history.json",     # تاریخچه فشرده‌سازی
     "comp_users.json",       # کاربران
+    "comp_wip.json",         # کارهای فشرده‌سازی نیمه‌کاره (اعتذار پس از ری‌استارت)
+    "gold_data.json",        # اکانت‌های طلایی و زیرمجموعه‌ها
+    "feat_flags.json",       # کلیدهای فعال/غیرفعال کردن قابلیت‌ها
     "comp_admins.json",      # مدیران شناخته‌شده
     "anten_votes.json",      # رأی‌های آنتن
     "anten_custom.json",     # پروکسی‌های آنتن

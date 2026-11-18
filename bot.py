@@ -112,6 +112,56 @@ HIST_FILE = Path("/tmp/comp_history.json")
 USERS_FILE = Path("/tmp/comp_users.json")
 ADMINS_KNOWN_FILE = Path("/tmp/comp_admins.json")
 
+WIP_FILE = Path("/tmp/comp_wip.json")     # کارهای فشرده‌سازیِ در جریان (اطلاع‌رسانی پس از ری‌استارت)
+
+
+def _wip_load():
+    try:
+        return json.loads(WIP_FILE.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        return {}
+
+
+def _wip_save(d):
+    try:
+        tmp = WIP_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(WIP_FILE)
+    except Exception:
+        pass
+
+
+def _wip_set(chat_id, info):
+    d = _wip_load(); d[str(chat_id)] = info; _wip_save(d)
+
+
+def _wip_clear(chat_id):
+    d = _wip_load()
+    if str(chat_id) in d:
+        d.pop(str(chat_id), None); _wip_save(d)
+
+
+async def _notify_interrupted_jobs():
+    """پس از هر بالا آمدن، به کاربرانی که کارشان وسط قطع شده اطلاع بده و پاک کن."""
+    d = _wip_load()
+    if not d:
+        return
+    for k, v in list(d.items()):
+        try:
+            name = ((v or {}).get("name") or "فایل")[:40]
+            mode = (v or {}).get("mode") or ""
+            await client.send_message(
+                int(k),
+                "⚠️ متأسفانه سرور وسط فشرده‌سازیِ «" + name + "» "
+                + (f"({mode}) " if mode else "") +
+                "ری‌استارت شد و کارت نیمه‌کاره ماند (محدودیت زمانی سرور رایگان است).\n"
+                "🙏 لطفاً دوباره همان فایل را بفرست؛ این‌بار احتمالاً کامل می‌شود.\n"
+                "💡 اگر فایل بزرگ است، حالت «⚡ توربو» خیلی سریع‌تر تمام می‌شود.")
+        except Exception:
+            pass
+    _wip_save({})
+    print(f"[wip] به {len(d)} کاربرِ قطع‌شده اطلاع داده شد.", flush=True)
+
 
 # ══════════════════════════════════════════════════════════════════
 # 🎬 بوت‌استرپ ffmpeg — بدون آن: فشرده‌سازی، ادغام ویدیو+صدا و
@@ -159,6 +209,10 @@ MAX_IN         = ACCEPT_MAX           # سازگاری با کدهای قدیم�
 FFMPEG_STALL_S = 180                  # اگر ffmpeg این‌قدر ثانیه خروجی نداد → متوقفش کن
 STALL_RECV_S   = 600                  # دریافت: بیش از این بدون پیشرفت → خطای روشن
 STALL_SEND_S   = 900                  # ارسال نتیجه: مهلت بیشتر برای فایل بزرگ/خط کند
+BIG_FILE_MAX   = 3_900_000_000        # بالاترین حد تلگرام (با اکانت پرمیوم ≈۴ گیگ)
+BOT_UNAME = ""                     # یوزرنیم بات برای لینک دعوت؛ هنگام شروع پر می‌شود
+SPLIT_THRESHOLD= 1_900_000_000        # خروجی بزرگ‌تر از این خودکار قسمت می‌شود
+TAG_BIG        = {}                    # چت‌هایی که تگِ فایل >۲ گیگ در جریان دارند
 MAX_COMPRESS_SECONDS = 3600
 COMPRESS_JOBS = {}   # chat_id → {"proc": Popen|None, "cancel": False}
 ARCHIVE_KEEP = 30            # حداکثر تعداد فایل نگه‌داشته‌شده برای مدیر
@@ -170,6 +224,7 @@ MODE_LABEL = {
     "quality": "✨ کمترین افت کیفیت", "hevc": "🔬 HEVC نصف",
     "audio": "🎵 فقط صدا", "soft": "🖼 کم‌حجم", "strong": "🖼 خیلی کم‌حجم",
     "96": "🎵 صدا 96k",
+    "turbo": "⚡ توربو (سریع‌ترین)",
 }
 
 BTN_HELP = "📖 راهنما"
@@ -476,18 +531,26 @@ async def note_user(e):
         pass
 
 
+def _kl(label):
+    """برچسب کیبورد با احترام به قابلیت‌های غیرفعال (خط‌خورده)."""
+    key = {BTN_AI: "ai", BTN_YT: "yt", BTN_DL: "dl", BTN_TAG: "tag",
+           BTN_ANTEN: "anten", BTN_FINDER: "finder", BTN_SELFDES: "sd"}.get(label)
+    return _strike(label) if (key and not feature_enabled(key)) else label
+
+
 def kb_for(chat_id):
     if chat_id in ADMIN_IDS:
         rows = [[Button.text(BTN_HELP, resize=True), Button.text(BTN_STATUS)]]
     else:
         rows = [[Button.text(BTN_HELP, resize=True)]]
     rows.append([Button.text(BTN_BARGH), Button.text(BTN_SUPPORT)])
-    rows.append([Button.text(BTN_ANTEN), Button.text(BTN_SELFDES)])
-    rows.append([Button.text(BTN_YT), Button.text(BTN_AI)])
+    rows.append([Button.text(_kl(BTN_ANTEN)), Button.text(_kl(BTN_SELFDES))])
+    rows.append([Button.text(_kl(BTN_YT)), Button.text(_kl(BTN_AI))])
     rows.append([Button.text(BTN_STT), Button.text(BTN_LINK)])
     rows.append([Button.text(BTN_INSTA)])
-    rows.append([Button.text(BTN_DL), Button.text(BTN_TAG)])
-    rows.append([Button.text(BTN_FINDER), Button.text(BTN_SUB)])
+    rows.append([Button.text(_kl(BTN_DL)), Button.text(_kl(BTN_TAG))])
+    rows.append([Button.text("👤 اطلاعات من"), Button.text(_kl(BTN_FINDER))])
+    rows.append([Button.text(BTN_SUB)])
     if chat_id in ADMIN_IDS:
         rows.append([Button.text(BTN_ADMIN)])
     return rows
@@ -591,7 +654,8 @@ def _ffmpeg_progress(cmd, prog=None, weight=(0.0, 1.0), duration=None, job=None)
 def compress_video(src: Path, dst: Path, mode: str, info: dict, prog: dict, job=None) -> Path:
     dur = max(info.get("duration") or 1, 1)
     src_mb = src.stat().st_size / 1024 / 1024
-    preset = "medium" if dur <= 45 * 60 else "fast"
+    # 🔧 سرعت محور: veryfast/superfast روی رانر چند برابر سریع‌تر از medium است؛ افت کیفیت در این کاربری ناچیز
+    preset = "veryfast" if dur <= 45 * 60 else "superfast"
 
     def audio_for(total_kbps):
         return max(32, min(128, total_kbps // 3))
@@ -613,7 +677,17 @@ def compress_video(src: Path, dst: Path, mode: str, info: dict, prog: dict, job=
         else:
             vcodec = ["-c:v", "libx264", "-preset", preset, "-b:v", f"{v_kbps}k"]
             vf = ["-vf", "scale=-2:min(720\\,ih)"]
-            _two_pass(src, dst, vcodec, vf, a_kbps, prog, dur, job)
+            # 🔧 تک‌گذره به جای دوگذره: تقریباً نصف زمان، دقت حجم ±۱۰٪ که اینجا کافیه
+            cmd = _video_cmd(src, dst, vcodec, vf, a_kbps)
+            _ffmpeg_progress(cmd, prog, (0.0, 1.0), dur, job)
+        return dst
+
+    if mode == "turbo":
+        # ⚡ سریع‌ترین حالت ممکن: ultrafast + CRF بالا + ۴۸۰p + صدای سبک (تک‌گذره)
+        vcodec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30"]
+        vf = ["-vf", "scale=-2:min(480\\,ih)"]
+        cmd = _video_cmd(src, dst, vcodec, vf, 64)
+        _ffmpeg_progress(cmd, prog, (0.0, 1.0), dur, job)
         return dst
 
     if mode == "quality":
@@ -631,7 +705,7 @@ def compress_video(src: Path, dst: Path, mode: str, info: dict, prog: dict, job=
 
 
 def _video_cmd(src, dst, vcodec, vf, a_kbps) -> list:
-    return ["ffmpeg", "-nostdin", "-loglevel", "error", "-y",
+    return ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-threads", "0",
             "-i", str(src), *vcodec, *vf,
             "-c:a", "aac", "-b:a", f"{a_kbps}k",
             "-movflags", "+faststart", str(dst)]
@@ -674,6 +748,39 @@ def compress_image(src: Path, dst: Path, strong: bool, prog: dict) -> Path:
     img.save(out, "JPEG", quality=60 if strong else 75, optimize=True)
     prog["pct"] = 1.0
     return out
+
+
+def _split_if_needed(path: Path, threshold: int = SPLIT_THRESHOLD) -> list:
+    """اگر خروجی هنوز خیلی بزرگ است، بدون re-encode به چند تکهٔ زمانی تقسیمش کن."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return [path]
+    if size <= threshold:
+        return [path]
+    try:
+        dur = max(float((ffprobe(path) or {}).get("duration") or 0), 1.0)
+    except Exception:
+        return [path]
+    import math
+    n = max(2, int(math.ceil(size / threshold * 1.08)))
+    seg = max(int(dur / n), 30)
+    tag = secrets.token_hex(3)
+    stem, ext = path.stem, (path.suffix or ".mp4")
+    pattern = str(path.with_name(f"{stem}_{tag}_part%02d{ext}"))
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-threads", "0",
+           "-i", str(path), "-map", "0", "-c", "copy",
+           "-f", "segment", "-segment_time", str(seg),
+           "-reset_timestamps", "1", pattern]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    except Exception:
+        return [path]
+    parts = sorted(q for q in path.parent.glob(f"{stem}_{tag}_part*{ext}")
+                   if q.exists() and q.stat().st_size > 0)
+    if r.returncode != 0 or not parts:
+        return [path]
+    return parts
 
 
 def cleanup_old():
@@ -1774,10 +1881,13 @@ async def _dl_deliver(chat_id, uc, mode, entity, msg, group_mode=False):
     try:
         name = (_dl_media_name(msg) or "فایل")
         size = _dl_media_size(msg)
-        if size > ACCEPT_MAX:
+        if size > BIG_FILE_MAX:
+            await client.send_message(chat_id, "❌ تلگرام حتی با اکانت پرمیوم بالاتر از ~۴ گیگابایت را منتقل نمی‌کند.")
+            return
+        if size > ACCEPT_MAX and not is_gold(chat_id):
             await client.send_message(
-                chat_id, f"❌ تلگرام فایل بالاتر از ~۲ گیگابایت را اصلاً منتقل نمی‌کند "
-                         f"(قول رسمی من {CAP_TEXT} است).")
+                chat_id, "👑 تحویل فایل بالای ۲ گیگابایت نیازمند «اکانت طلایی» است.\n"
+                         "رایگان طلایی شو: دکمهٔ «👤 اطلاعات من» لینک دعوتت را نشان می‌دهد (سه نفر)، یا به پشتیبانی پیام بده.")
             return
         ent_title = (getattr(entity, "title", None)
                      or getattr(entity, "username", None) or "کانال")
@@ -2311,9 +2421,21 @@ async def on_tag_file(e):
         await e.reply("این نوع پیام فایل ندارد — فیلم، آهنگ یا فایل بفرست.")
         raise events.StopPropagation
     f = m.file
-    if (f.size or 0) > ACCEPT_MAX:
-        await e.reply(f"❌ تلگرام بالاتر از ~۲ گیگابایت را منتقل نمی‌کند (قول رسمی من {CAP_TEXT} است).")
+    _tsize = f.size or 0
+    if _tsize > BIG_FILE_MAX:
+        await e.reply("❌ تلگرام حتی با اکانت پرمیوم بالاتر از ~۴ گیگابایت را منتقل نمی‌کند.")
         raise events.StopPropagation
+    TAG_BIG.pop(e.chat_id, None)
+    if _tsize > ACCEPT_MAX:
+        if not (globals().get("user_client") and user_client.is_connected()):
+            await e.reply("⚠️ برای تگِ فایل بالای ۲ گیگ باید «اکانت‌خوان» وصل باشد (مدیر: `/login`) یا فایل زیر سقف بفرست.")
+            raise events.StopPropagation
+        if not is_gold(e.sender_id):
+            await e.reply("👑 تگ کردن فایل بالای ۲ گیگابایت به «اکانت طلایی» نیاز دارد.\n"
+                          "رایگان طلایی شو: سه نفر را با لینک خودت بیاور (دکمهٔ «👤 اطلاعات من») یا به پشتیبانی پیام بده.",
+                          buttons=[[Button.inline("📊 وضعیت من / لینک دعوت", b"me:open")]])
+            raise events.StopPropagation
+        TAG_BIG[e.chat_id] = True
     old_name = f.name or ("عکس.jpg" if m.photo else "فایل")
     st_t.update({"step": "name", "msg": m, "old": old_name,
                  "is_media": _tag_is_media(m), "ts": time.time()})
@@ -2364,7 +2486,18 @@ async def _tag_run(chat_id, m, new_name, thumb_msg=None):
                 pass
 
         # دانلود در پوشه‌ی موقت (با اسم اصلی) بعد نام‌گذاری با اسم جدید
-        p = await m.download_media(file=str(tmpdir), progress_callback=_prog)
+        if TAG_BIG.pop(chat_id, None) and globals().get("user_client") and user_client.is_connected():
+            try:
+                await status.edit("⬇️ دریافت فایل بزرگ از مسیر امن…")
+            except Exception:
+                pass
+            try:
+                p = await _big_ingest_download(m, {"cur": 0, "total": (m.file.size or 0)})
+            except Exception as ex:
+                await status.edit(f"❌ دریافت فایل بزرگ ناموفق بود: {str(ex)[:130]}")
+                return
+        else:
+            p = await m.download_media(file=str(tmpdir), progress_callback=_prog)
         if not p or not Path(p).exists() or Path(p).stat().st_size == 0:
             await status.edit("❌ دانلود ناموفق بود.")
             return
@@ -8671,9 +8804,12 @@ async def cmd_perms(e):
 
 def _admin_kb():
     return [
+        [Button.inline("📣 پیام به کاربران", b"a:bc")],
         [Button.inline("🔑 اشتراک‌ها و مجوزها", b"a:sub")],
         [Button.inline("💬 صندوق پشتیبانی", b"a:support")],
         [Button.inline("👥 کاربران", b"a:users")],
+        [Button.inline("👑 طلایی — جستجو/فعال‌سازی", b"a:gold")],
+        [Button.inline("⚙️ قابلیت‌های روشن/خاموش", b"a:feat")],
         [Button.inline("📡 لیست پروکسی/کانفیگ", b"a:anten")],
         [Button.inline("🖥 اکانت‌خوان (وصل/قطع)", b"a:login")],
         [Button.inline("🏛 تنظیم گروه مای‌ربات", b"a:groupinfo")],
@@ -8713,6 +8849,28 @@ async def on_admin_cb(e):
             await e.edit(txt[:4000], buttons=kb)
         except Exception:
             await client.send_message(chat, txt[:4000], buttons=kb)
+
+    # ─── 👑 مدیریت طلایی / ⚙️ قابلیت‌ها ───────────────────────
+    if data == "gold":
+        await say("👑 مدیریت اکانت‌های طلایی\n\n"
+                  "روش سریع: روی دکمهٔ زیر بزن، سپس **اسم، @یوزرنیم یا آیدی عددی** را تایپ و ارسال کن.\n"
+                  "یا دستور: `/gsearch <عبارت>`\n\n"
+                  "در نتایج با یک ضربه، طلایی را فعال/غیرفعال کن؛ 🔄 هم اطلاعات کامل کاربر را نشان می\u200cدهد.",
+                  [[Button.switch_inline("🔍 شروع جستجو", "gfind ", same_peer=True)],
+                   [Button.inline("📊 آمار و فهرست طلایی‌ها", b"a:gstats")],
+                   [Button.inline("🔙 بازگشت", b"a:menu")]])
+        return
+    if data == "gstats":
+        await say(_golds_stats(), [[Button.inline("🔙 مدیریت طلایی", b"a:gold")]])
+        return
+    if data == "feat":
+        t, k = _feat_menu()
+        await say(t, k)
+        return
+    # ─── 📣 پیام به کاربران ────────────────────────────────
+    if data == "bc":
+        await bc_intro(chat)
+        return
 
     # ─── 🔑 توکن ربات — فقط مدیر، فقط چت خصوصی، با تأیید ───
     if data == "token":
@@ -9669,9 +9827,30 @@ async def on_file(e):
         await e.reply(_need_sub_reply(chat_id),
                       buttons=[[Button.inline("🔑 فعال‌سازی اشتراک", b"sub:start")]])
         return
-    if size > MAX_IN:
-        await e.reply(f"⛔ این فایل {fmt_size(size)} است؛ تلگرام بالاتر از ~۲ گیگابایت را منتقل نمی‌کند "f"(قول رسمی من {CAP_TEXT} است).")
+    if size > BIG_FILE_MAX:
+        await e.reply("❌ تلگرام حتی با اکانت پرمیوم هم بالاتر از ~۴ گیگابایت را منتقل نمی‌کند.")
         return
+    USE_BIG = size > ACCEPT_MAX
+    if USE_BIG:
+        _uc_ok = bool(globals().get("user_client") and user_client.is_connected())
+        if not _uc_ok:
+            await e.reply("⚠️ فایل بالای ~۲ گیگ فقط وقتی پردازش می‌شود که «اکانت‌خوان» وصل باشد (رایگان هم کافیست؛ پرمیوم فقط سریع‌تر).\n"
+                          "① مدیر `/login` را بزند و یک اکانت وصل کند؛\n"
+                          "② یا بدون هیچ اکانتی، فایل را جایی آپلود کن و لینکش را بده:\n"
+                          "   /zlink <آدرس مستقیم دانلود>  ← از اینترنت سرور گرفته می‌شود.",
+                    buttons=[[Button.inline("📖 راهنمای اتصال اکانت", b"help:reader"),
+                              Button.inline("🌐 روش لینک چیست؟", b"help:zlink")]])
+            return
+        if not is_gold(e.sender_id):
+            _rl = _ref_link(e.sender_id)
+            await e.reply(
+                "👑 این فایل بالای ۲ گیگابایت است؛ پردازش آن به «اکانت طلایی» نیاز دارد.\n\n"
+                "**رایگان طلایی شو:**\n"
+                f"① سه نفر را با لینک خودت به ربات بیاور:\n{_rl}\n"
+                "② یا به پشتیبانی پیام بده تا برایت فعال کنند.\n\n"
+                "💡 بدون طلا هم می‌توانی از روش لینک استفاده کنی: `/zlink …`",
+                buttons=[[Button.inline("📊 وضعیت من / لینک دعوت", b"me:open")]])
+            return
     if size < 100 * 1024:
         await e.reply("🙂 این فایل انقدر کوچیکه که احتیاجی به فشرده‌سازی نداره.")
         return
@@ -9683,6 +9862,8 @@ async def on_file(e):
         st = {"cur": 0, "total": size, "t0": time.time()}
 
         async def dl():
+            if USE_BIG:
+                return await _big_ingest_download(e.message, st)
             return await e.message.download_media(
                 file=str(WORKDIR),
                 progress_callback=lambda c, t: st.update(cur=c, total=t),
@@ -9742,6 +9923,7 @@ async def on_file(e):
     if info["video"] and (mime.startswith("video") or info["duration"] > 0):
         kind = KIND_VIDEO
         rows = [
+            [Button.inline("⚡ توربو — خیلی سریع (کیفیت کمتر)", b"v:turbo")],
             [Button.inline("🎯 نصف حجم (کیفیت خوب)", b"v:half"),
              Button.inline("📦 یک‌چهارم حجم", b"v:quarter")],
             [Button.inline("✨ کمترین افت کیفیت", b"v:quality"),
@@ -9848,6 +10030,7 @@ async def on_button(e):
             "name": req["name"], "size": old_size, "kind": kind, "mode": mode,
             "status": "در حال فشرده‌سازی", "pct": 0.0, "started": time.time(),
         }
+        _wip_set(chat_id, {"name": req["name"][:60], "mode": MODE_LABEL.get(mode, mode), "start": time.time()})
 
         task = asyncio.create_task(
             asyncio.to_thread(_compress_sync, src, base, kind, mode, info, prog, cjob)
@@ -9882,29 +10065,35 @@ async def on_button(e):
         note = ""
         if new_size >= old_size:
             note = "\n⚠️ نتیجه بزرگ‌تر از اصل شد (فایل از قبل فشرده بود)"
+        parts = _split_if_needed(out)
         cap = f"🗜 {fmt_size(old_size)} ← {fmt_size(new_size)}" + \
               (f" (کاهش {pct_red}%)" if pct_red > 0 else "") + note
 
         st = {"cur": 0, "total": new_size, "t0": time.time()}
 
         async def send():
-            kwargs = dict(caption=cap,
-                          progress_callback=lambda c, t: st.update(cur=c, total=t))
-            if kind == KIND_VIDEO and mode != "audio":
-                oi = await asyncio.to_thread(ffprobe, out)
-                kwargs.update(
-                    supports_streaming=True,
-                    attributes=[DocumentAttributeVideo(
-                        int(oi["duration"] or 1), oi["w"] or 480, oi["h"] or 480,
-                        supports_streaming=True)],
-                )
-            elif kind in (KIND_VIDEO, KIND_AUDIO):
-                oi = await asyncio.to_thread(ffprobe, out)
-                kwargs.update(attributes=[DocumentAttributeAudio(
-                    int(oi["duration"] or 1), title=req["name"][:60])])
-            m_ = await client.send_file(chat_id, str(out), **kwargs)
-            sent_msgs.append(m_)
-            return m_
+            results = []
+            total_parts = len(parts)
+            for idx_p, part_path in enumerate(parts, 1):
+                part_cap = cap + (f"\n📦 قسمت {idx_p}/{total_parts}" if total_parts > 1 else "")
+                kwargs = dict(caption=part_cap[:1024],
+                              progress_callback=lambda c, t: st.update(cur=c, total=t))
+                if kind == KIND_VIDEO and mode != "audio":
+                    oi = await asyncio.to_thread(ffprobe, part_path)
+                    kwargs.update(
+                        supports_streaming=True,
+                        attributes=[DocumentAttributeVideo(
+                            int(oi["duration"] or 1), oi["w"] or 480, oi["h"] or 480,
+                            supports_streaming=True)],
+                    )
+                elif kind in (KIND_VIDEO, KIND_AUDIO):
+                    oi = await asyncio.to_thread(ffprobe, part_path)
+                    kwargs.update(attributes=[DocumentAttributeAudio(
+                        int(oi["duration"] or 1), title=req["name"][:60])])
+                m_ = await client.send_file(chat_id, str(part_path), **kwargs)
+                sent_msgs.append(m_)
+                results.append(m_)
+            return results[-1] if results else None
 
         sent_msgs = []
 
@@ -9988,14 +10177,17 @@ async def on_button(e):
 
         # آرشیو برای مدیر (۴۸ ساعت)
         try:
-            shutil.move(str(out), str(ARCH_DIR / f"{code}{out.suffix}"))
+            for pi, pp in enumerate(parts, 1):
+                sfx = f"_{pi}" if len(parts) > 1 else ""
+                shutil.move(str(pp), str(ARCH_DIR / f"{code}{sfx}{pp.suffix}"))
         except Exception:
             pass
 
         el = int(time.time() - start)
         dur_txt = f"{el // 60}:{el % 60:02d}"
         await e.edit(f"✅ تمام شد! ({dur_txt})\n🗜 {fmt_size(old_size)} ← {fmt_size(new_size)}"
-                     + (f" (کاهش {pct_red}%)" if pct_red > 0 else ""))
+                     + (f" (کاهش {pct_red}%)" if pct_red > 0 else "") 
+                     + (f"\n📦 در {len(parts)} قسمت ارسال شد" if len(parts) > 1 else ""))
 
         u = users_seen.get(str(chat_id), {})
         history.append({
@@ -10013,12 +10205,13 @@ async def on_button(e):
         pending.pop(chat_id, None)
         save_pending()
     finally:
+        _wip_clear(chat_id)
         COMPRESS_JOBS.pop(chat_id, None)
         busy[chat_id] = False
-        for p in (out, src):
+        for p in ([src, out] + list(locals().get("parts", []))):
             if p:
                 try:
-                    Path(p).unlink(missing_ok=True)
+                    Path(str(p)).unlink(missing_ok=True)
                 except OSError:
                     pass
 
@@ -10085,6 +10278,81 @@ def _bc_menu(st):
     return "\n".join(lines), kb
 
 
+
+async def _big_ingest_download(orig_msg, st):
+    """دریافت فایل >۲ گیگ: ربات پیام را سرور-ساید به گروه فوروارد می‌کند (بدون ترافیک اضافه)،
+    سپس اکانت‌خوان (رایگان هم کافیست؛ پرمیوم فقط سرعت را بیشتر می‌کند) همان نسخه را دانلود می‌کند.
+    st را مثل دانلود معمولی به‌روز می‌کند تا نوار پیشرفت کار کند. خروجی: مسیر محلی."""
+    cfg = (GROUP_CFG or {}).get("media") or {}
+    chat = int(cfg.get("chat") or 0)
+    topic = cfg.get("topic")
+    uc = globals().get("user_client")
+    if not chat or not (uc and uc.is_connected()):
+        raise RuntimeError("برای فایل بالای ۲ گیگ، «اکانت‌خوان» وصل + تنظیم گروه لازم است.")
+    fwd_ids = None
+    try:
+        fwd = await client.forward_messages(chat, [orig_msg], top_msg_id=topic)
+        fwd_ids = [m.id for m in fwd]
+        path = await uc.download_media(
+            fwd[0], file=str(WORKDIR),
+            progress_callback=lambda c, t: st.update(cur=c, total=t))
+        if not path:
+            raise RuntimeError("دانلود نسخهٔ کمکی ناموفق بود — اتصال اکانت‌خوان را بررسی کن (برای دانلود، اکانت رایگان هم مجاز است).")
+        return path
+    finally:
+        if fwd_ids:
+            try:
+                await client.delete_messages(chat, fwd_ids)
+            except Exception:
+                pass
+
+
+async def bc_intro(chat_id):
+    """صفحهٔ شروعِ «پیام به کاربران» از داخل پنل مدیریت."""
+    txt = ("📣 پیام به کاربران\n\n"
+           "۱) متن/عکس/فایل نهایی‌ات را **همین‌جا** بفرست یا فوروارد کن.\n"
+           "۲) بعد دکمهٔ «✅ آخرین پیامم را بگیر» را بزن تا فهرست گیرنده‌ها بیاید.\n\n"
+           "💡 هرچه در آن پیام باشد (متن + رسانه) عیناً برای کاربران می‌رود.")
+    await client.send_message(
+        chat_id, txt, link_preview=False,
+        buttons=[[Button.inline("✅ آخرین پیامم را بگیر", b"bc:pick")],
+                 [Button.inline("✖ بستن", b"bc:close")]])
+
+
+async def _bc_pick(e):
+    """آخرین پیام محتوадار مدیر را گرفته، منوی انتخاب گیرنده را باز می‌کند."""
+    chat, admin = e.chat_id, e.sender_id
+    try:
+        msgs = await client.get_messages(chat, limit=8)
+    except Exception as ex:
+        await e.answer(f"خطا در خواندن پیام‌ها: {str(ex)[:60]}", alert=True); return
+    src = None
+    for m in msgs:
+        if m.id == e.message.id or getattr(m, "sender_id", None) != admin:
+            continue
+        if m.text or m.document or m.photo:
+            src = m; break
+    if src is None:
+        await e.answer("اول پیامِ تبلیغ را همین‌جا بفرست، بعد این دکمه را بزن.", alert=True); return
+    txt = (src.raw_text or src.text or "").strip() if src.text else ""
+    media_path = None
+    if src.document or src.photo:
+        try:
+            media_path = await src.download_media(file=f"/tmp/bc_{int(time.time())}")
+        except Exception as ex:
+            await e.answer(f"رسانه خوانده نشد: {str(ex)[:60]}", alert=True); return
+    targets = _bc_targets()
+    if not targets:
+        await e.answer("هنوز کاربری برای دریافت ثبت نشده است.", alert=True); return
+    old = BCAST.pop(chat, None)
+    if old:
+        _bc_cleanup(old)
+    st = {"text": txt, "media": media_path, "sel": None,
+          "ids": [u for u, _ in targets], "names": dict(targets), "msg": e.message.id}
+    BCAST[chat] = st
+    t, k = _bc_menu(st)
+    await e.edit(t, buttons=k)
+
 @client.on(events.NewMessage(pattern=r"^(?:/(?:bc|bcast|broadcast)(?:@\w+)?\b|📣 پیام همگانی)"))
 async def bc_start(e):
     if e.sender_id not in ADMIN_IDS or not e.is_private:
@@ -10143,6 +10411,13 @@ async def bc_cb(e):
     if e.sender_id not in ADMIN_IDS:
         await e.answer("فقط مدیر می‌تواند.", alert=True)
         return
+    raw = e.data.decode("utf-8", "ignore")
+    if raw == "bc:close":
+        await e.edit("👌 بسته شد.", buttons=[])
+        return
+    if raw == "bc:pick":
+        await _bc_pick(e)
+        return
     st = BCAST.get(e.chat_id)
     if not st:
         await e.edit("⏳ این منو منقضی شده؛ دوباره /bc را بزن.", buttons=[])
@@ -10188,43 +10463,605 @@ async def bc_cb(e):
         total = len(targets)
         base_text = st.get("text") or None
         media = st.get("media")
-        last_upd = 0.0
+        names = st.get("names", {})
+        c_chat, c_msg = e.chat_id, st["msg"]
+
+        async def _edit(txt):
+            try:
+                await client.edit_message(c_chat, c_msg, txt[:4000])
+            except Exception:
+                pass
+
+        await _edit(f"📣 شروع ارسال به {total} نفر…")
         for n, uid in enumerate(targets, 1):
-            if time.time() - last_upd > 2 or n in (1, total):
+            label = names.get(uid, str(uid))
+            head = (f"📣 در حال ارسال… {n}/{total}\n"
+                    f"✅ موفق: {ok}   ❌ ناموفق: {fail}")
+            sent = False
+            note = ""
+            for attempt in (1, 2):                     # حداکثر یک بار تلاش مجدد
                 try:
-                    await client.edit_message(
-                        e.chat_id, st["msg"],
-                        f"📣 در حال ارسال… {n}/{total}\n✅ موفق: {ok}   ❌ ناموفق: {fail}")
-                except Exception:
-                    pass
-                last_upd = time.time()
-            tries = 0
-            while True:
-                try:
-                    await client.send_message(uid, base_text or " ", file=media,
-                                              link_preview=False)
-                    ok += 1
+                    # 🔧 تایم‌اوت سخت: اگر RPC تلگرام قفل کرد، تا ابد منتظر نمانیم
+                    await asyncio.wait_for(
+                        client.send_message(uid, base_text or " ", file=media,
+                                            link_preview=False),
+                        timeout=120)
+                    sent = True
                     break
                 except FloodWaitError as fw:
-                    tries += 1
-                    if tries > 1:
-                        fail += 1
-                        break
-                    await asyncio.sleep(min(int(getattr(fw, "seconds", 5) or 5), 120))
-                except Exception:
-                    fail += 1                            # بلاک کرده/کاربر نیست و…
+                    wait_s = min(int(getattr(fw, "seconds", 5) or 5), 45)
+                    note = f"⚠️ محدودیت موقت تلگرام؛ {wait_s} ثانیه صبر کردم…"
+                    await _edit(head + "\n" + note)
+                    await asyncio.sleep(wait_s)
+                except asyncio.TimeoutError:
+                    note = f"⏱ تلگرام برای «{label}» پاسخ نداد → رد شد"
                     break
-            await asyncio.sleep(0.4)                     # فاصلهٔ ضداسپم بین ارسال‌ها
+                except Exception as ex:
+                    note = f"❌ {type(ex).__name__} برای «{label}»"
+                    break
+            if sent:
+                ok += 1
+                note = f"✅ برای «{label}» ارسال شد"
+            else:
+                fail += 1
+            await _edit(head + "\n" + note)
+            await asyncio.sleep(0.4)                   # فاصلهٔ ضداسپم
         _bc_cleanup(st)
+        summary = (f"✅ پایان ارسال همگانی\n👥 کل: {total}   ✅ موفق: {ok}   ❌ ناموفق: {fail}\n"
+                   "(ناموفق‌ها معمولاً کسانی‌اند که ربات را بلاک کرده‌اند یا چت خصوصی‌شان بسته است.)")
         try:
-            await client.edit_message(
-                e.chat_id, st["msg"],
-                f"✅ پایان ارسال همگانی\n👥 کل: {total}   ✅ موفق: {ok}   ❌ ناموفق: {fail}\n"
-                "(ناموفق‌ها معمولاً کسانی‌اند که ربات را بلاک کرده‌اند یا چت خصوصی‌شان بسته است.)",
-                buttons=[])
+            await client.edit_message(c_chat, c_msg, summary, buttons=[])
         except Exception:
             pass
+
+
+
+# ═══════════════ 🌐 کم‌حجم از لینک مستقیم (بدون محدودیت تلگرام/پرمیوم) ═══════════════
+_ZL_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124 Safari/537.36")
+_ZL_IMG_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
+def _zl_guess_name(url: str, headers: dict) -> str:
+    cd = (headers.get("content-disposition") or "")
+    if "filename=" in cd:
+        cand = cd.split("filename=", 1)[1].strip().strip('";\'').split(";")[0]
+        cand = pathlib.Path(urllib.parse.unquote(cand)).name
+        if 2 < len(cand) < 120:
+            return cand
+    tail = urllib.parse.unquote(url.rstrip("/").split("?")[0]).rsplit("/", 1)[-1]
+    tail = pathlib.Path(tail).name
+    return tail if (2 < len(tail) < 120 and "." in tail) else "file"
+
+
+def _zl_probe_headers(url: str) -> dict:
+    """HEAD چندگانه با curl؛ طول/نوع/اسم را برمی‌گرداند."""
+    import subprocess as _sp
+    r = _sp.run(["curl", "-sIL", "--max-time", "30", "--connect-timeout", "15",
+                 "-A", _ZL_UA, url], capture_output=True, text=True, timeout=60)
+    h = {}
+    if r.returncode != 0:
+        return h
+    for ln in reversed(r.stdout.splitlines()):       # آخرین پاسخ مؤثر
+        if ":" in ln:
+            k, v = ln.split(":", 1)
+            h.setdefault(k.strip().lower(), v.strip())
+    return h
+
+
+@client.on(events.NewMessage(pattern=r"^(?:/(?:zlink|fromlink|curlink)(?:@\w+)?\s+(https?://\S+)|🌐 کم‌حجم از لینک\s+https?://\S+)"))
+async def zl_start(e):
+    if not e.is_private and e.sender_id not in ADMIN_IDS:
+        return                                   # در گروه فقط مدیر
+    if not is_allowed_feat(e.chat_id, "compress"):
+        await e.reply(_need_sub_reply(e.chat_id))
         return
+    mtxt = e.text or ""
+    parts = mtxt.split(None, 1)
+    url = parts[1].strip() if len(parts) > 1 else ""
+    if not url:
+        await e.reply("🌐 برای فشرده‌سازی بدون محدودیت حجم:\n"
+                      "فایل را هر جا آپلود کن (مثلاً gofile.io بدون ثبت‌نام) و بنویس:\n"
+                      "`/zlink https://…آدرس مستقیم فایل…`\n\n"
+                      "💡 این روش به پرمیوم نیاز ندارد چون از اینترنت سرور دانلود می‌شود.")
+        return
+    url = url.split()[0]
+    chat_id = e.chat_id
+    status = await e.reply("⏳ بررسی لینک…")
+    tmp = None
+    try:
+        if not shutil.which("curl"):
+            raise RuntimeError("روی این محیط curl موجود نیست.")
+        hdr = await asyncio.to_thread(_zl_probe_headers, url)
+        try:
+            total = int((hdr.get("content-length") or "0"))
+        except ValueError:
+            total = 0
+        if total > BIG_FILE_MAX:
+            raise RuntimeError("این فایل حتی از سقف ۴ گیگابایت تلگرام هم بزرگ‌تر است؛ نمی‌شود.")
+        free_b = shutil.disk_usage(str(WORKDIR)).free
+        reserve = (total or 3 * 1024**3) + 1200 * 1024**2
+        if free_b < reserve:
+            raise RuntimeError(f"فضای کاری کافی نیست ({fmt_size(free_b)} آزاد؛ لازم ≈ {fmt_size(reserve)}).")
+        name = _zl_guess_name(url, hdr)
+        tmp = WORKDIR / f"zl_{int(time.time())}_{secrets.token_hex(3)}{pathlib.Path(name).suffix or '.bin'}"
+        await status.edit("⬇️ شروع دانلود از لینک…" + (f" ({fmt_size(total)})" if total else ""))
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-sSL", "--retry", "2", "--max-time", "10800",
+            "-A", _ZL_UA, "-o", str(tmp), url,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        stt = {"cur": 0, "t0": time.time(), "last_move": time.time()}
+        while proc.returncode is None:
+            await asyncio.sleep(4)
+            cur = tmp.stat().st_size if tmp.exists() else 0
+            if cur != stt["cur"]:
+                stt["cur"], stt["last_move"] = cur, time.time()
+            elif time.time() - stt["last_move"] > STALL_RECV_S:
+                proc.kill()
+                raise RuntimeError(f"دانلود بیش از {STALL_RECV_S // 60} دقیقه بدون پیشرفت ماند؛ لینک کند/قطع است.")
+            el = max(time.time() - stt["t0"], 1)
+            spd = cur / el
+            txt = f"⬇️ دانلود از لینک… "
+            txt += (f"{int(cur * 100 / total)}%" if total else fmt_size(cur))
+            txt += f"\n📊 {fmt_size(cur)}" + (f" از {fmt_size(total)}" if total else "") + \
+                   f"  ⚡ {fmt_size(spd)}/s  ⏱ {fmt_eta(max((total - cur) / max(spd, 1), 0) if total else 0)}"
+            try:
+                await status.edit(txt)
+            except Exception:
+                pass
+            try:
+                if proc.returncode is None:
+                    await asyncio.wait_for(proc.wait(), timeout=0.1)
+            except Exception:
+                pass
+        err = (await proc.stderr.read()).decode("utf-8", "ignore")[-160:] if proc.stderr else ""
+        if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+            raise RuntimeError(f"دانلود ناموفق بود (کد {proc.returncode}). {err}")
+        size = tmp.stat().st_size
+        src = WORKDIR / name
+        if src.exists():
+            src = WORKDIR / f"{int(time.time())}_{name}"
+        tmp.rename(src)
+        tmp = None
+        # ── شناسایی نوع و منوی حالت‌ها (مشابه مسیر معمولی) ──
+        ext = pathlib.Path(name).suffix.lower()
+        if ext in _ZL_IMG_EXT:
+            kind = KIND_IMAGE
+            info = {"duration": 0, "w": 0, "h": 0, "video": False, "audio": False}
+        else:
+            info = ffprobe(src)
+            if (info["video"] or info["duration"] > 0):
+                kind = KIND_VIDEO
+            elif info["audio"]:
+                kind = KIND_AUDIO
+            else:
+                src.unlink(missing_ok=True)
+                raise RuntimeError("این نوع فایل پشتیبانی نمی‌شود (ویدیو/صدا/عکس بفرست).")
+        if kind in (KIND_VIDEO, KIND_AUDIO) and not FFMPEG_OK:
+            src.unlink(missing_ok=True)
+            raise RuntimeError("ffmpeg روی سرور آماده نیست؛ بعداً تلاش کن.")
+        pending[str(chat_id)] = {"src": str(src), "size": size, "kind": kind,
+                                 "info": info, "name": name}
+        save_pending()
+        jobs[str(chat_id)] = {"name": name, "size": size, "kind": kind,
+                              "status": "در انتظار انتخاب کاربر"}
+        dur_txt = f" ⏱ {int(info['duration'] // 60)}:{int(info['duration'] % 60):02d}" if info.get("duration") else ""
+        dim_txt = f" 📐 {info['w']}×{info['h']}" if info.get("w") else ""
+        if kind == KIND_VIDEO:
+            rows = [
+                [Button.inline("⚡ توربو — خیلی سریع (کیفیت کمتر)", b"v:turbo")],
+                [Button.inline("🎯 نصف حجم (کیفیت خوب)", b"v:half"),
+                 Button.inline("📦 یک‌چهارم حجم", b"v:quarter")],
+                [Button.inline("✨ کمترین افت کیفیت", b"v:quality"),
+                 Button.inline("🔬 HEVC نصف حجم", b"v:hevc")],
+                [Button.inline("🎬 480p سبک", b"v:480")],
+                [Button.inline("🎵 فقط صدا (خیلی کم‌حجم)", b"v:audio")],
+            ]
+        elif kind == KIND_IMAGE:
+            rows = [[Button.inline("🖼 کم‌حجم", b"i:soft"),
+                     Button.inline("🖼 خیلی کم‌حجم", b"i:strong")]]
+        else:
+            rows = [[Button.inline("🎵 کم‌حجم کن (96kbps)", b"a:96")]]
+        await status.edit(
+            f"🌐 فایل از لینک دریافت شد: {fmt_size(size)}{dur_txt}{dim_txt}\n\n"
+            "چقدر کم‌حجمش کنم؟ 👇",
+            buttons=rows)
+    except Exception as ex:
+        log.exception("zlink failed")
+        if tmp:
+            try: tmp.unlink(missing_ok=True)
+            except Exception: pass
+        try:
+            await status.edit(f"❌ {str(ex)[:180]}")
+        except Exception:
+            await e.reply(f"❌ {str(ex)[:180]}")
+
+
+
+@client.on(events.CallbackQuery(pattern=r"^help:"))
+async def help_big_cb(e):
+    d = e.data.decode("utf-8", "ignore")
+    try:
+        await e.answer()
+    except Exception:
+        pass
+    if d == "help:reader":
+        await e.reply(
+            "📖 اتصال اکانت کمکی (رایگان، یک‌بار توسط مدیر):\n"
+            "۱) مدیر در پی‌وی ربات `/login` را بزند.\n"
+            "۲) شمارهٔ یک اکانت معمولی تلگرام را وارد و کد را فوروارد کند.\n"
+            "۳) تمام! از این پس فایل‌های بالای ۲ گیگ هم خودکار پردازش می‌شوند.\n\n"
+            "💡 پرمیوم لازم نیست؛ فقط اگر پرمیوم باشد سرعت دانلود بالاتر می‌رود.")
+    elif d == "help:zlink":
+        await e.reply(
+            "🌐 روش لینک (بدون هیچ اکانتی):\n"
+            "۱) فایل را هر جا آپلود کن؛ ساده‌ترین: سایت **gofile.io** (بدون ثبت‌نام).\n"
+            "۲) روی فایل Upload → بعد از اتمام، آدرس صفحه یا دکمهٔ Download را کپی کن.\n"
+            "۳) همین‌جا بنویس: `/zlink` و بعد آدرس را Paste کن و بفرست.\n\n"
+            "⚡ ربات از اینترنت پرسرعت سرور دانلود می‌کند؛ سقف عملی ~۴ گیگابایت.")
+
+
+
+
+# ═══════════════ 👑 اکانت طلایی + زیرمجموعه‌گیری ═══════════════
+GOLD_FILE = Path("/tmp/gold_data.json")
+REFS_FOR_GOLD = 3
+
+
+def _gold_load():
+    try:
+        return json.loads(GOLD_FILE.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        return {}
+
+
+def _gold_save(d):
+    try:
+        tmp = GOLD_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(GOLD_FILE)
+    except Exception:
+        pass
+
+
+def _gu(d, uid):
+    return d.setdefault(str(uid), {"refs": [], "gold": False, "by": "", "pname": "", "puname": ""})
+
+
+def is_gold(uid) -> bool:
+    try:
+        return bool((_gold_load().get(str(uid)) or {}).get("gold"))
+    except Exception:
+        return False
+
+
+def _set_gold(uid, on: bool, by="admin"):
+    d = _gold_load(); u = _gu(d, uid)
+    u["gold"] = bool(on)
+    if on:
+        u["by"] = by
+    _gold_save(d)
+
+
+def _ref_link(uid) -> str:
+    base = BOT_UNAME or "bot"
+    return f"https://t.me/{base}?start=ref_{int(uid)}"
+
+
+def _attribute_ref(parent_uid, child_uid, child_name="", child_uname="") -> str:
+    """ثبت زیرمجموعهٔ تازه. خروجی: new|dup|self|bad|gold"""
+    try:
+        parent_uid = int(parent_uid); child_uid = int(child_uid)
+    except Exception:
+        return "bad"
+    if parent_uid == child_uid:
+        return "self"
+    if parent_uid <= 0:
+        return "bad"
+    d = _gold_load()
+    pu = _gu(d, parent_uid); cu = _gu(d, child_uid)
+    if cu.get("parent"):
+        return "dup"
+    cu["parent"] = parent_uid
+    cu["pname"] = (child_name or "")[:40]; cu["puname"] = (child_uname or "")[:30]
+    if child_uid not in pu["refs"]:
+        pu["refs"].append(child_uid)
+    just = ""
+    if not pu.get("gold") and len(pu["refs"]) >= REFS_FOR_GOLD:
+        pu["gold"] = True; pu["by"] = "referral"; just = "gold"
+    _gold_save(d)
+    return just or "new"
+
+
+def _profile_parts(uid):
+    d = _gold_load(); u = _gu(d, uid)
+    seen = (users_seen or {}).get(str(uid), {}) or {}
+    name = seen.get("name") or u.get("pname") or "کاربر"
+    uname = seen.get("uname") or u.get("puname") or ""
+    refs = u.get("refs", [])
+    n = len(refs)
+    bar = "█" * min(n, REFS_FOR_GOLD) + "░" * max(REFS_FOR_GOLD - n, 0)
+    lines = ["👤 اطلاعات حساب شما",
+             f"• نام: {name}" + (f"  (@{uname})" if uname else ""),
+             "• وضعیت: " + ("👑 طلایی ✅" if u.get("gold") else "عادی ⚪")]
+    if u.get("gold"):
+        why = {"referral": "از راه زیرمجموعه", "admin": "فعال‌سازی مدیر"}.get(u.get("by", ""), "")
+        if why:
+            lines.append(f"   دلیل: {why}")
+    lines.append(f"• زیرمجموعه: {n}/{REFS_FOR_GOLD}  {bar}")
+    if n:
+        lines.append("   فهرست:")
+        shown = 0
+        for rid in list(refs)[-15:]:
+            rs = (users_seen or {}).get(str(rid), {}) or {}
+            rn = rs.get("name") or d.get(str(rid), {}).get("pname") or str(rid)
+            ru = rs.get("uname") or d.get(str(rid), {}).get("puname") or ""
+            lines.append(f"   • {rn}" + (f" @{ru}" if ru else "")); shown += 1
+        if n > shown:
+            lines.append(f"   … و {n - shown} نفر دیگر")
+    link = _ref_link(uid)
+    lines += ["", "🔗 لینک دعوت شما:", link]
+    if not u.get("gold"):
+        lines.append(f"\nبا {max(REFS_FOR_GOLD - n, 0)} دعوت دیگر، خودکار طلایی می‌شوی (پردازش فایل‌های بالای ۲ گیگ).")
+    return "\n".join(lines), link
+
+
+async def _send_profile(target, uid):
+    txt, link = _profile_parts(uid)
+    kb = [[Button.url("📤 اشتراک لینک دعوت",
+                      "https://t.me/share/url?url=" + urllib.parse.quote(link) +
+                      "&text=" + urllib.parse.quote("با این ربات فایل‌هایت را کم‌حجم کن 👇"))]]
+    if hasattr(target, "reply"):
+        await target.reply(txt, buttons=kb, link_preview=False)
+    else:
+        await client.send_message(int(target), txt, buttons=kb, link_preview=False)
+
+
+@client.on(events.NewMessage(pattern=r"^/start ref_(\d+)$"))
+async def ref_start(e):
+    if not e.is_private:
+        raise events.StopPropagation
+    try:
+        parent = int(e.pattern_match.group(1))
+    except ValueError:
+        raise events.StopPropagation
+    child = e.sender_id
+    try:
+        note_user(e)
+    except Exception:
+        pass
+    seen = (users_seen or {}).get(str(child), {}) or {}
+    res = _attribute_ref(parent, child, seen.get("name", ""), seen.get("uname", ""))
+    if res == "dup":
+        head = "🙂 خوش آمدی! (قبلاً زیرمجموعهٔ کسی ثبت شده بودی.)"
+    elif res == "self":
+        head = "🙂 خوش آمدی!"
+    else:
+        head = "✅ خوش آمدی! به‌عنوان زیرمجموعه ثبت شدی."
+    await e.reply(head + "\n\n🎬 همین حالا فایلت را بفرست تا کم‌حجمش کنم. راهنما: /help")
+    if res == "gold":
+        try:
+            await client.send_message(parent,
+                "🎉 تبریک! سه نفر با لینک تو عضو شدند — اکانتت **طلایی** شد 👑\n"
+                "حالا فایل‌های بالای ۲ گیگابایت هم برایت پردازش می‌شود.")
+        except Exception:
+            pass
+    raise events.StopPropagation
+
+
+@client.on(events.NewMessage(pattern=r"^(?:/(?:me|ref|invite)(?:@\w+)?|👤 اطلاعات من)$"))
+async def cmd_me(e):
+    if not e.is_private:
+        return
+    try:
+        note_user(e)
+    except Exception:
+        pass
+    await _send_profile(e, e.sender_id)
+    raise events.StopPropagation
+
+
+@client.on(events.CallbackQuery(pattern=r"^me:"))
+async def me_cb(e):
+    try:
+        await e.answer()
+    except Exception:
+        pass
+    await _send_profile(e.chat_id, e.sender_id)
+
+
+@client.on(events.NewMessage(pattern=r"^/gold (\d+) (on|off)$"))
+async def adm_gold_set(e):
+    if e.sender_id not in ADMIN_IDS:
+        return
+    uid = int(e.pattern_match.group(1)); on = e.pattern_match.group(2) == "on"
+    _set_gold(uid, on, by="admin")
+    await e.reply(("👑 طلایی فعال شد برای " if on else "⚪ طلایی غیرفعال شد برای ") + f"{uid}.")
+    raise events.StopPropagation
+
+
+def _golds_stats() -> str:
+    d = _gold_load()
+    golds = [(k, v) for k, v in d.items() if v.get("gold")]
+    lines = [f"👑 کاربران طلایی: {len(golds)} نفر", ""]
+    for k, v in golds[:20]:
+        nm = ((users_seen or {}).get(k, {}) or {}).get("name") or v.get("pname") or k
+        un = ((users_seen or {}).get(k, {}) or {}).get("uname") or v.get("puname") or ""
+        by = {"referral": "زیرمجموعه", "admin": "مدیر"}.get(v.get("by", ""), "؟")
+        lines.append(f"• {nm}" + (f" @{un}" if un else "") + f"  ({len(v.get('refs', []))} دعوت — {by})")
+    top = sorted(((k, len(v.get("refs", []))) for k, v in d.items()), key=lambda x: -x[1])[:5]
+    tops = [t for t in top if t[1]]
+    if tops:
+        lines.append("\n🏆 بیشترین دعوت‌ها:")
+        for k, c in tops:
+            nm = ((users_seen or {}).get(k, {}) or {}).get("name") or k
+            lines.append(f"   {nm}: {c} نفر")
+    return "\n".join(lines)[:3800] if len(lines) > 2 else "هیچ کاربر طلایی‌ای نیست."
+
+
+@client.on(events.NewMessage(pattern=r"^/golds?(?:@\w+)?$"))
+async def adm_golds_list(e):
+    if e.sender_id not in ADMIN_IDS:
+        return
+    await e.reply(_golds_stats())
+    raise events.StopPropagation
+
+
+
+
+# ═══════════════ ⚙️ کلیدهای فعال/غیرفعال کردن قابلیت‌ها ═══════════════
+FEAT_FILE = Path("/tmp/feat_flags.json")
+FEAT_NAMES = {
+    "compress": "🎬 کم"+Z+"حجم کردن",
+    "tag":      "🏷 تگ/تغییر نام",
+    "ai":       "🤖 هوش مصنوعی",
+    "yt":       "▶️ یوتیوب",
+    "dl":       "📥 دانلود از کانال",
+    "anten":    "📡 آنتن/پروکسی",
+    "finder":   "🔍 فایل"+Z+"یاب",
+    "sd":       "📸 عکس خودمحو",
+}
+
+
+def _flags_load():
+    try:
+        return json.loads(FEAT_FILE.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        return {}
+
+
+def _flags_save(d):
+    try:
+        t = FEAT_FILE.with_suffix(".tmp")
+        t.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        t.replace(FEAT_FILE)
+    except Exception:
+        pass
+
+
+def feature_enabled(key: str) -> bool:
+    return bool(_flags_load().get(key, True))
+
+
+def _set_feature(key: str, on: bool):
+    d = _flags_load(); d[key] = bool(on); _flags_save(d)
+
+
+def _strike(t: str) -> str:
+    """خط کشیدن روی متن (نشانگر غیرفعال بودن در کیبورد)."""
+    return "".join(ch + "\u0336" for ch in str(t))
+
+
+BTN_FEAT_MAP = {
+    "ai": "BTN_AI", "yt": "BTN_YT", "dl": "BTN_DL", "tag": "BTN_TAG",
+    "anten": "BTN_ANTEN", "finder": "BTN_FINDER", "sd": "BTN_SELFDES",
+}
+_CONST2FEAT = {v: k for k, v in BTN_FEAT_MAP.items()}
+
+
+def _kbt(label, resize=True):
+    key = globals().get("_CONST2FEAT_LOCAL", {}).get(label)
+    txt = _strike(label) if (key and not feature_enabled(key)) else label
+    return Button.text(txt, resize=resize)
+
+
+def _feat_menu():
+    lines = ["⚙️ قابلیت‌های ربات",
+             "روی هر مورد بزن تا فعال/غیرفعال شود.",
+             "غیرفعال = در کیبورد کاربران خط می\u200cخورد و قفل می\u200cشود (مدیر همیشه دسترسی دارد).", ""]
+    kb = []
+    for key, nm in FEAT_NAMES.items():
+        on = feature_enabled(key)
+        lab = ("✅ " if on else "🚫 ") + nm
+        kb.append([Button.inline(lab, f"ft:{key}".encode())])
+    kb.append([Button.inline("🔙 بازگشت به پنل", b"a:menu")])
+    return "\n".join(lines), kb
+
+
+@client.on(events.CallbackQuery(pattern=r"^ft:"))
+async def ft_toggle(e):
+    if e.sender_id not in ADMIN_IDS:
+        await e.answer("فقط مدیر.", alert=True); return
+    key = e.data.decode().split(":", 1)[1]
+    if key not in FEAT_NAMES:
+        await e.edit("نامعتبر.", buttons=[]); return
+    _set_feature(key, not feature_enabled(key))
+    await e.answer(("فعال شد ✅ " if feature_enabled(key) else "غیرفعال شد 🚫 ") + FEAT_NAMES[key])
+    t, k = _feat_menu()
+    await e.edit(t, buttons=k)
+
+
+# ── مدیریت طلایی با جستجو ──
+GOLD_SEARCH = {}   # chat(admin) → آخرین عبارت جستجو
+
+
+def _gold_results(q: str):
+    q = (q or "").strip()
+    ql = q.lower()
+    matches = []
+    for sid, v in (users_seen or {}).items():
+        try:
+            uid = int(sid)
+        except ValueError:
+            continue
+        if uid <= 0 or uid in ADMIN_IDS:
+            continue
+        name = (v.get("name") or ""); uname = (v.get("uname") or "")
+        hay = f"{sid} {name} {uname}".lower()
+        ok = (q.isdigit() and sid == q) or (ql and ql in hay)
+        if ok:
+            matches.append((uid, name, uname, int(v.get("jobs") or 0)))
+    matches.sort(key=lambda r: (-r[3], -(len(r[1]))))
+    total = len(matches)
+    shown = matches[:8]
+    lines = [f"👑 نتایج برای «{q}» — {total} کاربر"]
+    if not shown:
+        lines.append("😕 چیزی پیدا نشد. (کاربر باید حداقل یک‌بار با ربات کار کرده باشد.)")
+    kb = []
+    for uid, name, uname, jobs in shown:
+        disp = (("@" + uname) if uname else (name or str(uid)))
+        disp = (disp[:24] + "…") if len(disp) > 25 else disp
+        g = is_gold(uid)
+        lab = ("👑✅ " if g else "⚪➖ ") + disp
+        kb.append([Button.inline(lab, f"gset:{uid}:{0 if g else 1}".encode()),
+                   Button.inline("🔄" , f"grfw:{uid}".encode())])
+    kb.append([Button.switch_inline("🔍 جستجوی جدید", "gfind ", same_peer=True)])
+    return "\n".join(lines), kb
+
+
+@client.on(events.NewMessage(pattern=r"^(?:gfind |\/gsearch )(.+)$"))
+async def adm_gsearch(e):
+    if e.sender_id not in ADMIN_IDS or not e.is_private:
+        raise events.StopPropagation
+    q = e.pattern_match.group(1).strip()
+    GOLD_SEARCH[e.chat_id] = q
+    t, k = _gold_results(q)
+    await e.reply(t, buttons=k)
+    raise events.StopPropagation
+
+
+@client.on(events.CallbackQuery(pattern=r"^gset:"))
+async def gset_cb(e):
+    if e.sender_id not in ADMIN_IDS:
+        await e.answer("فقط مدیر.", alert=True); return
+    _, uid_s, want = e.data.decode().split(":")
+    uid = int(uid_s)
+    _set_gold(uid, want == "1", by="admin")
+    await e.answer(("👑 طلایی فعال شد" if want == "1" else "⚪ طلایی غیرفعال شد") + f" — {uid}")
+    q = GOLD_SEARCH.get(e.chat_id, "")
+    t, k = _gold_results(q or str(uid))
+    try:
+        await e.edit(t, buttons=k)
+    except Exception:
+        pass
+
+
+@client.on(events.CallbackQuery(pattern=r"^grfw:"))
+async def grfw_cb(e):
+    if e.sender_id not in ADMIN_IDS:
+        await e.answer(); return
+    uid = int(e.data.decode().split(":")[1])
+    await _send_profile(e.chat_id, uid)
 
 
 # ---------------------------------------------------------------- برق کاشان
@@ -10832,9 +11669,11 @@ def is_allowed(chat_id) -> bool:
 
 
 def is_allowed_feat(chat_id, feat) -> bool:
-    """دسترسی به یک ویژگی خاص — محدودیت اختصاصی هر کاربر اولویت دارد"""
+    """دسترسی به یک ویژگی خاص — اول کلید سراسری مدیر، بعد اشتراک کاربر."""
     if chat_id in ADMIN_IDS:
         return True
+    if not feature_enabled(feat):
+        return False
     p = SUBS.get("perms", {}).get(str(chat_id), {})
     if feat in p:
         return bool(p[feat]) and is_allowed(chat_id)
@@ -11669,6 +12508,16 @@ def main():
     BOT_SELF_ID = me.id
     log.info("Compressor bot @%s started (admins: %s)", me.username, ADMIN_IDS or "—")
     print(f"✅ BOT_UP: @{me.username} (compressor)", flush=True)
+    try:
+        client.loop.run_until_complete(_notify_interrupted_jobs())
+    except Exception as _e:
+        print("[wip] notify:", str(_e)[:80], flush=True)
+    try:
+        _me_obj = client.loop.run_until_complete(client.get_me())
+        BOT_UNAME = (_me_obj.username or "") if _me_obj else ""
+        print(f"[init] BOT_UNAME = {BOT_UNAME or '(نامشخص)'}", flush=True)
+    except Exception:
+        pass
     client.run_until_disconnected()
 
 
