@@ -13119,19 +13119,28 @@ def _invite_text(uid) -> str:
     ])
 
 
+def _invite_share_text(uid) -> str:
+    """متنی که پنجرهٔ اشتراک‌گذاری تلگرام با خودش می‌برد (خط آخرِ «👉 آچار فرانسه»
+    لازم نیست، چون خودِ لینک پایینِ متن می‌نشیند)."""
+    return "\n".join([
+        f"🤖 ربات آچار فرانسه — رباتِ همه‌کارهٔ رایگان با امکانات زیره:",
+        *INVITE_LINES[1:-1],
+        INVITE_LINES[-1],
+    ])
+
+
+def _invite_share_url(uid) -> str:
+    """🔗 آدرس دکمهٔ «اشتراک‌گذاری مستقیم»: پنجرهٔ انتخاب مخاطبِ تلگرام باز می‌شود،
+    مخاطب را خودت انتخاب می‌کنی و همین متن + لینکِ زیرمجموعه برایش می‌رود."""
+    return ("https://t.me/share/url?url=" + urllib.parse.quote(_ref_link(uid), safe="")
+            + "&text=" + urllib.parse.quote(_invite_share_text(uid), safe=""))
+
+
 def _invite_plain(uid) -> str:
     """📋 همان متن، ولی ساده و قابل کپی‌کردن (لینک آخرش خام است)."""
     link = _ref_link(uid)
     head, mid, tail = INVITE_LINES[0].replace("**", ""), INVITE_LINES[1:-1], INVITE_LINES[-1]
     return "\n".join([f"🤖 {head}", *mid, tail, link])
-
-
-def _invite_share_url(uid) -> str:
-    """آدرس «اشتراک‌گذاری مستقیم» — پنجرهٔ انتخاب مخاطب تلگرام باز می‌شود
-    و همین متن آماده + لینک، آمادهٔ ارسال است."""
-    txt = _invite_plain(uid).replace(_ref_link(uid), "").strip()
-    return ("https://t.me/share/url?url=" + urllib.parse.quote(_ref_link(uid), safe="")
-            + "&amp;text=" + urllib.parse.quote(txt, safe=""))   # &amp; برای HTML
 
 
 def _invite_anchor(uid) -> str:
@@ -13201,7 +13210,9 @@ def _profile_parts(uid):
 
 async def _send_profile(target, uid):
     txt, link = _profile_parts(uid)
-    kb = [[Button.inline("📤 اشتراک‌گذاری مستقیم", b"ref:share")]]
+    # دکمهٔ شیشه‌ای که خودش لینک است: لمس → پنجرهٔ اشتراک‌گذاری/انتخاب مخاطب
+    # (Button.url در این نسخهٔ تلگرام دکمهٔ inline با نوع URL می‌سازد)
+    kb = [[Button.url("📤 اشتراک‌گذاری مستقیم", _invite_share_url(uid))]]
     if hasattr(target, "reply"):
         await target.reply(txt, buttons=kb, link_preview=False, parse_mode="html")
     else:
