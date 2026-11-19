@@ -122,8 +122,18 @@ _RT = _runtime_flag_load()
 USERBOT_ENABLED = bool(_RT.get("userbot", _env_flag("USERBOT_ENABLED", True)))
 # 🚫 مسدودسازی کامل «برق کاشان» (پاییز/زمستان) — پیش‌فرض: مسدود نیست
 BARGH_BLOCKED = bool(_RT.get("bargh_blocked", False))
-# 🔔 گزارش «ربات روشن شد» — پیش‌فرض خاموش تا ری‌استارت‌های خودکار پیام ندهند
-STARTUP_REPORT = bool(_RT.get("startup_report", False))
+# 🔔 گزارش «ربات روشن شد»:
+#    روشن‌شدنِ خودکار (کرانِ ۶ ساعته / ری‌استارت زمان‌بندی‌شده) → همیشه بی‌صدا
+#    روشن‌شدنِ دستی (Run workflow / ری‌استارت دستی / ادمین) → همیشه اعلان
+#    منبع تشخیص: RUN_TRIGGER  (schedule | workflow_dispatch | push | …)
+RUN_TRIGGER = (os.environ.get("RUN_TRIGGER")
+               or os.environ.get("GITHUB_EVENT_NAME") or "").strip().lower()
+_IS_AUTO_START = RUN_TRIGGER in ("schedule", "cron", "auto", "restart")
+_ann_env = (os.environ.get("STARTUP_ANNOUNCE") or "").strip().lower()
+if _ann_env in ("1", "0"):
+    STARTUP_REPORT = _ann_env == "1"
+else:
+    STARTUP_REPORT = not _IS_AUTO_START
 
 
 def _bargh_blocked() -> bool:
@@ -743,6 +753,64 @@ except Exception:
     pass
 
 
+DL_CHUNK = int(os.environ.get("DL_CHUNK_KB", "1024")) * 1024   # ۱ مگابایت در هر درخواست
+
+
+async def _dl_resume(msg, dest, st=None):
+    """📥 دانلودِ ادامه‌پذیر — کلید سرعت و مقاومت در برابر مرز ۶ ساعته.
+
+    چرا؟ `download_media` تلگرام از صفر شروع می‌کند؛ اگر پنجره تمام شود، تمام
+    بایت‌های گرفته‌شده دور می‌ریختند. اینجا تکه‌تکه در فایل `<نام>.part` می‌نویسیم
+    و اگر اجرا قطع شد، اجرای بعد با `offset` از همان‌جا ادامه می‌دهد.
+
+    نکتهٔ فنی: offset در تلگرام باید مضربِ ۴۰۹۶ باشد، پس انتهای ناهم‌تراز بریده
+    می‌شود (حداکثر ۴ کیلوبایت دوباره گرفته می‌شود — ناچیز).
+    """
+    dest = Path(str(dest))
+    part = Path(str(dest) + ".part")
+    f_obj = getattr(msg, "file", None)
+    total = int(getattr(f_obj, "size", 0) or 0) if f_obj else 0
+    have = part.stat().st_size if part.exists() else 0
+
+    if total and have >= total:
+        part.replace(dest)
+        return str(dest)
+
+    if have:
+        aligned = have - (have % 4096)
+        if aligned != have:
+            try:
+                with open(part, "r+b") as t_:
+                    t_.truncate(aligned)
+                have = aligned
+            except Exception:
+                have = 0
+        log.info("dl_resume: ادامه از %.1fMB (%.0f%%)",
+                 have / 1048576, (have * 100 / total) if total else 0)
+
+    if st is not None:
+        st.update(cur=have, total=total or st.get("total") or 0, t0=time.time())
+
+    got = have
+    mode = "ab" if have else "wb"
+    with open(part, mode) as f:
+        async for chunk in client.iter_download(
+                msg.media, offset=have or None, request_size=DL_CHUNK):
+            f.write(chunk)
+            got += len(chunk)
+            if st is not None:
+                st["cur"] = got
+
+    if total and got < total:
+        raise RuntimeError(f"دریافت ناقص ماند ({fmt_size(got)} از {fmt_size(total)}) — "
+                           "دفعهٔ بعد از همین‌جا ادامه می‌دهم")
+    part.replace(dest)
+    if st is not None:
+        st["cur"] = got
+    log.info("dl_resume: کامل شد (%.1fMB)", got / 1048576)
+    return str(dest)
+
+
 def _cache_path(name_tag, suffix=".bin"):
     return str(CACHE_DIR / f"{name_tag}_{secrets.token_hex(3)}{suffix or '.bin'}")
 
@@ -760,6 +828,8 @@ def _cache_prune(keep_bytes=int(os.environ.get("CACHE_KEEP_MB", "3000")) * 1024 
             o = (j or {}).get("out")
             if o and _file_ok(o, (j or {}).get("out_size") or 0):
                 keep.add(str(Path(str(o))))
+        # 📥 فایل‌های نیمه‌دانلودشده (.part) هم نگه داشته می‌شوند — پیشرفتِ دانلود
+        parts = {str(q) for q in CACHE_DIR.glob("*.part")}
         total = 0
         files = sorted(CACHE_DIR.glob("*"), key=lambda q: q.stat().st_size, reverse=True)
         for f in files:
@@ -767,7 +837,7 @@ def _cache_prune(keep_bytes=int(os.environ.get("CACHE_KEEP_MB", "3000")) * 1024 
                 sz = f.stat().st_size
             except Exception:
                 continue
-            if str(f) in keep and total + sz <= keep_bytes:
+            if (str(f) in keep or str(f) in parts) and total + sz <= keep_bytes:
                 total += sz
                 continue
             try:
@@ -1434,14 +1504,16 @@ async def on_cancel_cb(e):
     await e.answer("در حال لغو…")
 
 
-@client.on(events.CallbackQuery(pattern=r"^(?:bargh|startup):toggle$"))
+@client.on(events.CallbackQuery(pattern=r"^bargh:toggle$"))
 async def season_cb(e):
-    """کلیدهای فصلی: مسدودسازی برق کاشان + گزارش روشن‌شدن."""
-    global BARGH_BLOCKED, STARTUP_REPORT
+    """کلید فصلی: مسدودسازی کامل «برق کاشان»."""
+    global BARGH_BLOCKED
     if e.sender_id not in ADMIN_IDS:
         await e.answer("فقط مدیر.", alert=True)
         return
     data = e.data.decode("utf-8", "ignore")
+    if not data.startswith("bargh:"):
+        return
     if data.startswith("bargh:"):
         BARGH_BLOCKED = not BARGH_BLOCKED
         _runtime_flag_set("bargh_blocked", BARGH_BLOCKED)
@@ -1469,13 +1541,6 @@ async def season_cb(e):
                 client.loop.call_soon(lambda: asyncio.ensure_future(bargha.nightly_loop(client)))
             except Exception:
                 pass
-    else:
-        STARTUP_REPORT = not STARTUP_REPORT
-        _runtime_flag_set("startup_report", STARTUP_REPORT)
-        txt = ("🔔 از این پس هر بار ربات روشن شود، یک پیام وضعیت برایت می‌آید."
-               if STARTUP_REPORT else
-               "🔕 گزارش روشن‌شدن خاموش شد — ری‌استارت‌های خودکار پیامی نمی‌فرستند.")
-        await e.answer("تغییر کرد")
     try:
         await e.edit(txt, buttons=[[Button.inline("⚙️ قابلیت‌ها", b"a:feat")],
                                    [Button.inline("🔙 پنل", b"a:menu")]])
@@ -2204,7 +2269,7 @@ async def _restore_dl_sessions():
     store = _load_dl_store()
     for k, sess in list(store.items()):
         try:
-            uc = TelegramClient(StringSession(sess), API_ID, API_HASH)
+            uc = TelegramClient(StringSession(sess), API_ID, API_HASH, catch_up=False)
             await uc.connect()
             if await uc.is_user_authorized():
                 await _start_dl_client(int(k), uc)
@@ -2588,7 +2653,7 @@ async def _dl_login_text(e, st, t):
             return
         phone = t if t.startswith("+") else "+" + t
         try:
-            uc = TelegramClient(StringSession(), API_ID, API_HASH)
+            uc = TelegramClient(StringSession(), API_ID, API_HASH, catch_up=False)
             await uc.connect()
             await uc.send_code_request(phone)
         except Exception as ex:
@@ -3305,7 +3370,7 @@ async def handle_sd_login_text(e):
             return
         phone = t if t.startswith("+") else "+" + t
         try:
-            uc = TelegramClient(StringSession(), API_ID, API_HASH)
+            uc = TelegramClient(StringSession(), API_ID, API_HASH, catch_up=False)
             await uc.connect()
             await uc.send_code_request(phone)
         except Exception as ex:
@@ -9513,9 +9578,7 @@ def _admin_kb():
         [Button.inline("👑 طلایی — جستجو/فعال‌سازی", b"a:gold")],
         [Button.inline("⚙️ قابلیت‌های روشن/خاموش", b"a:feat")],
         [Button.inline("🚫 برق کاشان: مسدود" if not BARGH_BLOCKED
-                       else "✅ برق کاشان: آزاد", b"bargh:toggle"),
-         Button.inline("🔔 گزارش روشن‌شدن: " + ("روشن" if STARTUP_REPORT else "خاموش"),
-                       b"startup:toggle")],
+                       else "✅ برق کاشان: آزاد", b"bargh:toggle")],
         [Button.inline("📡 لیست پروکسی/کانفیگ", b"a:anten")],
         [Button.inline("🖥 اکانت‌خوان (وصل/قطع)", b"a:login")],
         [Button.inline("🏛 تنظیم گروه مای‌ربات", b"a:groupinfo")],
@@ -10897,9 +10960,7 @@ async def _pending_download(e, chat_id, req):
     async def dl():
         if use_big:
             return await _big_ingest_download(msg, st)
-        return await msg.download_media(
-            file=_cache_path(f"src{chat_id}"),
-            progress_callback=lambda c, t: st.update(cur=c, total=t))
+        return await _dl_resume(msg, _cache_path(f"src{chat_id}"), st)
 
     _t_dl0 = time.time()
     task = asyncio.create_task(dl())
@@ -11188,34 +11249,25 @@ async def on_button(e):
                     oi = await asyncio.to_thread(ffprobe, part_path)
                     kwargs.update(attributes=[DocumentAttributeAudio(
                         int(oi["duration"] or 1), title=req["name"][:60])])
-                stored = None
+                # ۱️⃣ اولویت اول: خودِ کاربر — یک آپلود، مستقیم برای او
+                m_ = await client.send_file(chat_id, str(part_path), **kwargs)
+                # ۲️⃣ بعد آرشیو در گروه رسانه با «کپی سرور-ساید» از همان پیام
+                #     (هیچ آپلود دومی در کار نیست؛ اگر هم کپی نشد، فقط لاگ می‌شود
+                #      و تحویلِ کاربر که انجام شده، دست‌نخورده می‌ماند)
                 _cfg_m = GROUP_CFG.get("media") or {}
                 if _cfg_m.get("chat"):
                     try:
-                        stored = await client.send_file(
-                            _cfg_m["chat"], str(part_path),
-                            reply_to=_cfg_m.get("topic"), **kwargs)
+                        st_ = await client.send_file(
+                            _cfg_m["chat"], m_.media, reply_to=_cfg_m.get("topic"))
+                        if st_ is not None:
+                            try:
+                                _ids = list((_resume_load().get(str(chat_id)) or {}).get("store_ids") or [])
+                                _ids.append(st_.id)
+                                _resume_set(chat_id, store_chat=_cfg_m["chat"], store_ids=_ids)
+                            except Exception:
+                                pass
                     except Exception as ex:
-                        log.warning("store-to-group: %s", str(ex)[:120])
-                        stored = None
-                if stored is not None:
-                    try:
-                        _ids = list((_resume_load().get(str(chat_id)) or {}).get("store_ids") or [])
-                        _ids.append(stored.id)
-                        _resume_set(chat_id, store_chat=_cfg_m["chat"], store_ids=_ids)
-                    except Exception:
-                        pass
-                    m_ = await _copy_media_to(chat_id, stored, part_cap[:1024])
-                    if m_ is None:                      # اگر کپی نشد، مسیر معمولی
-                        m_ = await client.send_file(chat_id, str(part_path), **kwargs)
-                    else:
-                        try:                            # گروه شلوغ نشود
-                            await client.delete_messages(_cfg_m["chat"], [stored.id])
-                            _resume_set(chat_id, store_ids=[], store_chat=None)
-                        except Exception:
-                            pass
-                else:
-                    m_ = await client.send_file(chat_id, str(part_path), **kwargs)
+                        log.warning("archive-copy: %s", str(ex)[:120])
                 sent_msgs.append(m_)
                 results.append(m_)
             return results[-1] if results else None
@@ -11366,25 +11418,20 @@ async def on_button(e):
 async def _copy_media_to(dst_chat, src_msg, caption=None):
     """کپیِ سرور-سایدِ یک رسانه (بدون آپلود مجدد و بدون هدر «فوروارد»).
 
-    از InputMediaDocument/InputMediaPhoto استفاده می‌کند؛ تلگرام خودش نسخه را
-    برای مقصد می‌سازد. یعنی «آپلود یک‌بار، تحویل چندبار».
+    🔧 باگ مهمی که همین‌جا بود: `InputMediaDocument(..., caption=...)` — کلاس TL
+    پارامتر `caption` ندارد، پس هر بار TypeError می‌داد، `None` برمی‌گشت و کد
+    مجبور می‌شد فایل را **از نو آپلود** کند (همان ۲ دقیقهٔ اضافه‌ای که کاربر
+    دید: ادمین فایل را از گروه دیده بود، کاربر باید منتظر آپلود دوم می‌ماند).
+
+    راه درست: خودِ `MessageMedia*` را به `send_file` بده. Telethon آن را به
+    `InputMediaDocument(id=InputDocument(...))` تبدیل می‌کند و تلگرام نسخه را
+    روی سرور برای مقصد می‌سازد — نه بایت بالا می‌رود، نه پایین.
     """
     try:
-        from telethon.tl.types import (InputMediaDocument, InputDocument,
-                                       InputMediaPhoto, InputPhoto)
-        d = getattr(src_msg, "document", None)
-        ph = getattr(src_msg, "photo", None)
-        if d is not None:
-            media = InputMediaDocument(
-                InputDocument(id=d.id, access_hash=d.access_hash,
-                              file_reference=d.file_reference), caption=caption)
-        elif ph is not None:
-            media = InputMediaPhoto(
-                InputPhoto(id=ph.id, access_hash=ph.access_hash,
-                           file_reference=ph.file_reference), caption=caption)
-        else:
+        media = getattr(src_msg, "media", None)
+        if media is None:
             return None
-        return await client.send_file(dst_chat, media)
+        return await client.send_file(dst_chat, media, caption=caption)
     except Exception as ex:
         log.warning("copy_media: %s", str(ex)[:150])
         return None
@@ -13975,7 +14022,7 @@ async def handle_login_text(e):
             return
         phone = t if t.startswith("+") else "+" + t
         try:
-            uc = TelegramClient(StringSession(), API_ID, API_HASH)
+            uc = TelegramClient(StringSession(), API_ID, API_HASH, catch_up=False)
             await uc.connect()
             await uc.send_code_request(phone)
         except Exception as ex:
@@ -14274,9 +14321,24 @@ def _mk_sd_media_handler(owner_id, uc):
             m = e.message
             if not m.media or getattr(m, "sticker", None):
                 return
+            _cid = int(getattr(m, "chat_id", 0) or 0)
             # 🔁 رسانه‌ای که قبلاً ذخیره شده، دوباره دانلود/ارسال نشود
-            if _seen_hit(int(getattr(m, "chat_id", 0) or 0), m.id):
+            if _seen_hit(_cid, m.id):
                 return
+            # 🕰 رسانهٔ قدیمی (قبل از روشن شدن این اجرا) → فقط علامت بخورد، دانلود نشود.
+            #   عکس خودمحو بعد از مدتی از سرور پاک می‌شود؛ تلاش برای گرفتنش هر ری‌استارت
+            #   یک دانلودِ تکراری بود (خطای EXPIRED) — حالا یک‌سره رد می‌شود.
+            try:
+                _dt = getattr(m, "date", None)
+                if _dt is not None and (time.time() - _dt.timestamp()) > 180:
+                    _seen_mark(_cid, m.id)
+                    log.info("sd[%s]: رسانهٔ قدیمی (%d دقیقه قبل) رد شد — نه دانلود، نه ارسال",
+                             owner_id, int((time.time() - _dt.timestamp()) / 60))
+                    return
+            except Exception:
+                pass
+            # علامت بزن *قبل* از دانلود: اگر دانلود شکست خورد، ری‌استارت بعدی دوباره تلاش نکند
+            _seen_mark(_cid, m.id)
             timed = _is_timed_media(m)
             if not timed and SD_SETTINGS.get("capture_mode", "all") != "all":
                 return
@@ -14325,10 +14387,6 @@ def _mk_sd_media_handler(owner_id, uc):
             except Exception:
                 pass
             Path(path).unlink(missing_ok=True)
-            try:
-                _seen_mark(int(getattr(m, "chat_id", 0) or 0), m.id)
-            except Exception:
-                pass
             TTL_STATS["saved"] += 1
             try:
                 u_ = users_seen.setdefault(str(owner_id), {})
@@ -14359,7 +14417,7 @@ async def _restore_sd_sessions():
     store = _load_sd_store()
     for k, sess in list(store.items()):
         try:
-            uc = TelegramClient(StringSession(sess), API_ID, API_HASH)
+            uc = TelegramClient(StringSession(sess), API_ID, API_HASH, catch_up=False)
             await uc.connect()
             if await uc.is_user_authorized():
                 await _start_sd_client(int(k), uc)
@@ -14893,7 +14951,7 @@ async def _restore_user_client():
                 return
         if not s:
             return
-        uc = TelegramClient(StringSession(s), API_ID, API_HASH)
+        uc = TelegramClient(StringSession(s), API_ID, API_HASH, catch_up=False)
         await uc.connect()
         if not await uc.is_user_authorized():
             SESSION_FILE.unlink(missing_ok=True)
@@ -14938,11 +14996,11 @@ async def _startup_report():
         ai_ver = getattr(aichat, "VERSION", "?") if AI_OK else "—"
         ig_ver = getattr(insta, "VERSION", "?") if INSTA_OK else "—"
         if not globals().get("STARTUP_REPORT"):
-            log.info("startup: گزارش روشن‌شدن خاموش است (ری‌استارت خودکار → بی‌صدا)")
+            log.info("startup: روشن‌شدن خودکار (%s) → بی‌صدا", RUN_TRIGGER or "auto")
             return
         await client.send_message(
             int(next(iter(ADMIN_IDS))),
-            f"🤖 ربات روشن شد ({BOT_VERSION})\n"
+            f"🤖 ربات روشن شد ({BOT_VERSION}) — روشن‌شدن دستی 🖐\n"
             f"🎬 ffmpeg: {'✅ آماده' if FFMPEG_OK else '❌ ندارد!'}\n"
             f"📦 ماژول‌ها: ytube {yt_ver} | aichat {ai_ver} | insta {ig_ver}\n"
             f"🧠 هوش مصنوعی: {ai_line}\n{ub}\n"
