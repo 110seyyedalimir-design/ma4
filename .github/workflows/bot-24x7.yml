@@ -58,17 +58,42 @@ jobs:
           pip install -r requirements-gha.txt
 
       - name: Check environment
+        timeout-minutes: 8
         run: |
-          # اگر ffmpeg یا ffprobe روی رانر نبود، نصبش کن (فشرده‌سازی/استخراج صوت به هر دو نیاز دارد)
+          # ffmpeg/ffprobe لازم است (فشرده‌سازی، استخراج صدا، ادغام).
+          # ترتیب: اگر روی رانر بود که هیچ → نسخهٔ static (≈۵ ثانیه) → apt (کندتر).
           if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
-            echo "⬇️ ffmpeg/ffprobe پیدا نشد — در حال نصب…"
-            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+            echo "⬇️ ffmpeg/ffprobe پیدا نشد — نصب سریع نسخهٔ static…"
+            ok=0
+            cd /tmp
+            if timeout 150 curl -fsSL --retry 2 -o ff.tar.xz \
+                 https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz; then
+              tar -xf ff.tar.xz 2>/dev/null || true
+              d=$(ls -d /tmp/ffmpeg-*-amd64-static 2>/dev/null | head -1)
+              if [ -n "$d" ] && [ -x "$d/ffmpeg" ]; then
+                if sudo -n install -m 755 "$d/ffmpeg" "$d/ffprobe" /usr/local/bin/ 2>/dev/null; then
+                  ok=1
+                else
+                  mkdir -p "$HOME/.local/bin"
+                  install -m 755 "$d/ffmpeg" "$d/ffprobe" "$HOME/.local/bin/" && \
+                    echo "$HOME/.local/bin" >> "$GITHUB_PATH" && ok=1
+                fi
+                [ "$ok" = "1" ] && echo "✅ static ffmpeg نصب شد"
+              fi
+            fi
+            if [ "$ok" != "1" ]; then
+              echo "⚠️ static نصب نشد — تلاش با apt (۱ تا ۲ دقیقه)…"
+              sudo apt-get update -qq || true
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ffmpeg || true
+            fi
           fi
           echo "ffmpeg:  $(command -v ffmpeg || echo MISSING)"
           echo "ffprobe: $(command -v ffprobe || echo MISSING)"
           (ffmpeg -hide_banner -version 2>/dev/null | head -1) || true
-          python -c "import telethon, yt_dlp; print('telethon', telethon.__version__, '| yt-dlp', yt_dlp.version.__version__)"
+          python -c "import telethon, yt_dlp; print('telethon', telethon.__version__, '| yt-dlp', yt_dlp.version.__version__)" \
+            || echo "⚠️ یکی از پکیج‌ها نیست — مرحلهٔ Install dependencies را ببین (اجرا متوقف نمی‌شود)"
           echo "دیسک آزاد: $(df -h /tmp | tail -1 | awk '{print $4}')"
+          echo "✅ محیط آماده است — رفتن به مرحلهٔ بعد"
 
       # ── 🌱 بازگردانی از متن بکاپ تلگرامی (اختیاری، یک‌بار مصرف) ───────────────
       # اگر Secret با نام TG_BACKUP_TEXT ساخته باشی، محتوای پیام «🗂 داده‌های ربات»
@@ -96,15 +121,29 @@ jobs:
       #     echo "✅ تانل Cloudflare بالا آمد"
       # ─────────────────────────────────────────────────────────────────────────
 
+      # ♻️ کشِ فایل‌های نیمه‌کاره: خروجیِ فشرده‌شده‌ای که آپلود نشده، اینجا می‌ماند
+      #    (سقفِ کش هر مخزن ۱۰ گیگ رایگان است و بین اجراها باقی می‌ماند)
+      - name: Restore job files (cache)
+        uses: actions/cache@v4
+        with:
+          path: /tmp/jobcache
+          key: jobcache-${{ github.run_id }}
+          restore-keys: |
+            jobcache-
+
       - name: Run bots
         env:
           # ── ربات ۱: آچارفرانسه ──
           BOT_TOKEN:           ${{ secrets.BOT_TOKEN }}
           ADMIN_IDS:           ${{ secrets.ADMIN_IDS }}
           AI_API_KEY:          ${{ secrets.AI_API_KEY }}
-          USERBOT_ENABLED:     ${{ vars.USERBOT_ENABLED }}
+          # 🔐 کلید رمزنگاری نشست‌های اکانت‌خوان (بدون این، /login قفل نمی‌شود)
+          SESSION_KEY:         ${{ secrets.SESSION_KEY }}
+          # یوزرنیم ربات برای لینک دعوت (اگر خودکار تشخیص داده نشد)
+          BOT_USERNAME:        ${{ vars.BOT_USERNAME }}
+          USERBOT_ENABLED:     ${{ vars.USERBOT_ENABLED || '1' }}
           AGENT_ENABLED:       ${{ vars.AGENT_ENABLED }}
-          SDSEND_ENABLED:      ${{ vars.SDSEND_ENABLED }}
+          SDSEND_ENABLED:      ${{ vars.SDSEND_ENABLED || '1' }}
           # ── ربات ۲: دوربرگردون ──
           DOR_BOT_TOKEN:       ${{ secrets.DOR_BOT_TOKEN }}
           DOR_ADMIN_ID:        ${{ secrets.DOR_ADMIN_ID }}
@@ -132,9 +171,18 @@ jobs:
           ENABLE_BOT2:         ${{ vars.ENABLE_BOT2 || '0' }}
           PERSIST_SECONDS:     "30"          # ذخیرهٔ داده هر ۳۰ ثانیه (ری‌استارت ۶ ساعته)
           PORT:                "7860"
+          RUN_LIMIT_MIN:       "335"          # ربات بداند چه زمانی اجرا تمام می‌شود
         run: |
           set -o pipefail
           echo "⏳ شروع اجرا در $(date -u '+%F %T UTC') — تا ~۵ ساعت و ۴۰ دقیقه"
           # TERM در دقیقهٔ ۳۴۰؛ اگر ۶۰ ثانیه بعد هنوز زنده بود KILL
           timeout --signal=TERM --kill-after=60s 340m python -u run_all.py
           echo "✅ پایان اجرا در $(date -u '+%F %T UTC') — اجرای بعدی از صف جایگزین می‌شود"
+
+      - name: Save job files (cache)
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: /tmp/jobcache
+          key: jobcache-${{ github.run_id }}
+          # اگر کلیدی تکراری باشد چیزی ذخیره نمی‌شود؛ run_id یکتاست
