@@ -13256,7 +13256,8 @@ async def ref_start(e):
         head = "🙂 خوش آمدی!"
     else:
         head = "✅ خوش آمدی! به‌عنوان زیرمجموعه ثبت شدی."
-    await e.reply(head + "\n\n🎬 همین حالا فایلت را بفرست تا کم‌حجمش کنم. راهنما: /help")
+    # 👋 در استارتِ با لینک دعوت (چه بار اول، چه دفعات بعد): فهرست کامل امکانات
+    await e.reply(head + "\n\n" + WELCOME_NEW + "\n\n📖 راهنما: /help")
     if res == "gold":
         try:
             await client.send_message(parent,
