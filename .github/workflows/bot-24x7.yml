@@ -172,6 +172,8 @@ jobs:
           PERSIST_SECONDS:     "30"          # ذخیرهٔ داده هر ۳۰ ثانیه (ری‌استارت ۶ ساعته)
           PORT:                "7860"
           RUN_LIMIT_MIN:       "335"          # ربات بداند چه زمانی اجرا تمام می‌شود
+          # 🖐 منبع روشن‌شدن: schedule = خودکار (بی‌صدا) | workflow_dispatch = دستی (اعلان)
+          RUN_TRIGGER:         ${{ github.event_name }}
         run: |
           set -o pipefail
           echo "⏳ شروع اجرا در $(date -u '+%F %T UTC') — تا ~۵ ساعت و ۴۰ دقیقه"
