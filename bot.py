@@ -13092,22 +13092,42 @@ def _ref_link(uid) -> str:
     return f"https://t.me/{base}?start=ref_{int(uid)}"
 
 
-def _invite_text(uid) -> str:
-    """📨 متن آمادهٔ دعوت — ۵ خط، با امکانات جذاب (مخصوصاً «عکس خودمحو»).
+INVITE_LINES = (
+    "ربات آچار فرانسه — رباتِ همه‌کارهٔ **رایگان** با امکانات زیره:",
+    "📸 عکس خودمحو — عکسِ زمان‌دار و نابودشوندهٔ تلگرام را عکسِ عادی و دائمی می‌کند",
+    "🗜 کم‌حجم کردن فایل • 🏷 تگ فایل • 🔗 فایل به لینک • 📥 کانال محدود",
+    "🎬 یوتیوب • 📸 اینستاگرام • 🤖 هوش مصنوعی • 🎙 ویس به متن",
+    "📡 آنتن • ⚡ برق کاشان • 🔎 مزاحم‌یاب • و چند امکان دیگر",
+    "برای استفاده، روی لینک زیر بزن 👇",
+)
 
-    هر جا «آچار فرانسه» نوشته شده، خودش لینک است: کاربر آدرس `?start=ref_…`
+
+def _invite_text(uid) -> str:
+    """📨 متن آمادهٔ دعوت — نسخهٔ غنی (HTML).
+
+    هر جا «آچار فرانسه» نوشته شده، خودش لینک است: مخاطب آدرس `?start=ref_…`
     را نمی‌بیند، ولی لمس هر کدام همان لینک زیرمجموعه‌ای را باز می‌کند.
     (نیاز به parse_mode="html")
     """
     link = _ref_link(uid)
-    a = f'<a href="{link}">آچار فرانسه</a>'
-    return (
-        f"🤖 <b>{a}</b> — ربات همه‌کارهٔ تلگرام\n"
-        "📸 عکسِ زمان‌دار و نابودشوندهٔ تلگرام را عکسِ عادی و دائمی می‌کند\n"
-        "🗜 کم‌حجم کردن فایل • 🎬 یوتیوب • 📸 اینستاگرام • 🔗 فایل به لینک\n"
-        "🤖 هوش مصنوعی • 🎙 ویس به متن • 📡 آنتن • ⚡ برق کاشان • 🔎 مزاحم‌یاب\n"
-        f"👉 شروع: {a}"
-    )
+    head, mid, tail = INVITE_LINES[0], INVITE_LINES[1:-1], INVITE_LINES[-1]
+    return "\n".join([f"🤖 <b>{head}</b>", *mid, tail,
+                       f'<a href="{link}">🤖 آچار فرانسه</a>'])
+
+
+def _invite_plain(uid) -> str:
+    """📋 همان متن، ولی ساده و قابل کپی‌کردن (لینک آخرش خام است)."""
+    link = _ref_link(uid)
+    head, mid, tail = INVITE_LINES[0].replace("**", ""), INVITE_LINES[1:-1], INVITE_LINES[-1]
+    return "\n".join([f"🤖 {head}", *mid, tail, link])
+
+
+def _invite_share_url(uid) -> str:
+    """آدرس «اشتراک‌گذاری مستقیم» — پنجرهٔ انتخاب مخاطب تلگرام باز می‌شود
+    و همین متن آماده + لینک، آمادهٔ ارسال است."""
+    txt = _invite_plain(uid).replace(_ref_link(uid), "").strip()
+    return ("https://t.me/share/url?url=" + urllib.parse.quote(_ref_link(uid), safe="")
+            + "&amp;text=" + urllib.parse.quote(txt, safe=""))   # &amp; برای HTML
 
 
 def _invite_anchor(uid) -> str:
@@ -13167,7 +13187,15 @@ def _profile_parts(uid):
         if n > shown:
             lines.append(f"   … و {n - shown} نفر دیگر")
     link = _ref_link(uid)
-    lines += ["", "🔗 لینک دعوت شما (لمسش کن):", _invite_anchor(uid)]
+    lines += ["",
+              "📋 <b>این متن را کپی کن</b> و برای هر کسی خواستی بفرست:",
+              f"<pre>{_invite_plain(uid)}</pre>",
+              "",
+              "🔗 لینک دعوت شما:",
+              f"<code>{link}</code>",
+              "",
+              f'📤 <a href="{_invite_share_url(uid)}">اشتراک‌گذاری مستقیم</a>'
+              " — مخاطب را خودت انتخاب می‌کنی، متن آماده هم خودکار می‌رود"]
     if not u.get("gold"):
         lines.append(f"\nبا {max(REFS_FOR_GOLD - n, 0)} دعوت دیگر، خودکار طلایی می‌شوی (پردازش فایل‌های بالای {CAP_TEXT}).")
     return "\n".join(lines), link
@@ -13175,7 +13203,7 @@ def _profile_parts(uid):
 
 async def _send_profile(target, uid):
     txt, link = _profile_parts(uid)
-    kb = [[Button.inline("📤 متن آمادهٔ دعوت", b"ref:share")]]
+    kb = [[Button.inline("📨 متن آمادهٔ دعوت", b"ref:share")]]
     if hasattr(target, "reply"):
         await target.reply(txt, buttons=kb, link_preview=False, parse_mode="html")
     else:
@@ -13194,8 +13222,10 @@ async def ref_share_cb(e):
         e.chat_id, _invite_text(e.sender_id), parse_mode="html", link_preview=False)
     await client.send_message(
         e.chat_id,
-        "☝️ همین پیام را برای دوستت فوروارد کن.\n"
-        "او روی «آچار فرانسه» بزند، ربات باز می‌شود و زیرمجموعهٔ تو ثبت می‌شود.")
+        "☝️ دو راه: <b>فوروارد</b> همین پیام، یا <b>کپی</b> متن زیر 👇\n\n"
+        f"<pre>{_invite_plain(e.sender_id)}</pre>\n"
+        "هر کس روی «آچار فرانسه» بزند، ربات باز می‌شود و زیرمجموعهٔ تو ثبت می‌شود.",
+        parse_mode="html", link_preview=False)
 
 
 @client.on(events.NewMessage(pattern=r"^/start ref_(\d+)$"))
