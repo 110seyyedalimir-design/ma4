@@ -95,9 +95,18 @@ def run_script(script: str, label: str, extra_env=None):
         threading.Thread(target=_pipe, args=(p, label), daemon=True).start()
         code = p.wait()
         up = int(time.time() - started)
-        log(f"{label}: خارج شد (کد {code}) بعد از {up} ثانیه — ری‌استارت در ۵ ثانیه")
+        log(f"{label}: خارج شد (کد {code}) بعد از {up} ثانیه")
         if _stop.is_set():
             break
+        # 🛑 مرز پایان اجرا (۶ ساعته): ربات خودش تمیز خارج شد → ری‌استارت نکن
+        try:
+            if code == 0 and os.path.exists("/tmp/.run_deadline"):
+                log("⏳ نشانگر پایان اجرا — سوپروایزر هم تمام می‌کند تا مرحلهٔ ذخیرهٔ کش اجرا شود")
+                _stop.set()
+                break
+        except Exception:
+            pass
+        log(f"{label}: ری‌استارت در ۵ ثانیه")
         _stop.wait(5)
 
 

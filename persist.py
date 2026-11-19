@@ -58,6 +58,8 @@ FILES = [
     "aigroup.json",           # تنظیم گروه هوش مصنوعی
     "autoreply.json",         # منشی‌های فعال
     "bot_session.json",       # نشست ربات (ضد FloodWait تلگرام)
+    "resume_jobs.json",        # کارهای نیمه‌کارهٔ فایل (ادامه پس از ری‌استارت)
+    "seen_media.json",         # پیام‌های رسانه‌ای که قبلاً پردازش شده‌اند
     "afk.json",               # حالت خارج از دسترس
     "filters.json",           # فیلترهای خودکار پیوی
     "welcome.json",           # گروه‌های خوش‌آمدگویی

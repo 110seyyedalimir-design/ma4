@@ -120,6 +120,21 @@ def _runtime_flag_set(key: str, val):
 
 _RT = _runtime_flag_load()
 USERBOT_ENABLED = bool(_RT.get("userbot", _env_flag("USERBOT_ENABLED", True)))
+# 🚫 مسدودسازی کامل «برق کاشان» (پاییز/زمستان) — پیش‌فرض: مسدود نیست
+BARGH_BLOCKED = bool(_RT.get("bargh_blocked", False))
+# 🔔 گزارش «ربات روشن شد» — پیش‌فرض خاموش تا ری‌استارت‌های خودکار پیام ندهند
+STARTUP_REPORT = bool(_RT.get("startup_report", False))
+
+
+def _bargh_blocked() -> bool:
+    return bool(globals().get("BARGH_BLOCKED"))
+
+
+try:                                   # کلید مسدودسازی را از همان اول وصل کن
+    import bargha as _bargha_mod
+    _bargha_mod.BLOCK_CHECK = _bargh_blocked
+except Exception:
+    pass
 AGENT_ENABLED = _env_flag("AGENT_ENABLED", False)
 # ۳) SDSEND_ENABLED (پیش‌فرض روشن!) — فقط «ارسال خودموف به دیگران» (/sdto)
 #    مستقل از دستیار: حتی وقتی AGENT_ENABLED=0 است، /sdto کار می‌کند
@@ -225,6 +240,18 @@ def _bootstrap_ffmpeg():
 FFMPEG_OK = False
 _bootstrap_ffmpeg()
 print(f"🎬 ffmpeg: {'✅ آماده' if FFMPEG_OK else '❌ وجود ندارد!'}", flush=True)
+
+
+def _ffmpeg_ready() -> bool:
+    """اگر ffmpeg/ffprobe نبود، یک‌بار دیگر (در لحظهٔ نیاز) نصبش کن."""
+    global FFMPEG_OK
+    if FFMPEG_OK:
+        return True
+    try:
+        _bootstrap_ffmpeg()
+    except Exception:
+        pass
+    return bool(FFMPEG_OK)
 try:
     if YT_OK:
         ytube.ensure_ffmpeg()
@@ -242,7 +269,8 @@ FFMPEG_STALL_S = 180                  # اگر ffmpeg این‌قدر ثانیه
 STALL_RECV_S   = 600                  # دریافت: بیش از این بدون پیشرفت → خطای روشن
 STALL_SEND_S   = 900                  # ارسال نتیجه: مهلت بیشتر برای فایل بزرگ/خط کند
 BIG_FILE_MAX   = 3_900_000_000        # بالاترین حد تلگرام (با اکانت پرمیوم ≈۴ گیگ)
-BOT_DL_MAX     = 19_000_000           # سقف دانلود «ربات» در تلگرام ≈۲۰ مگابایت
+BOT_DL_MAX     = 19_000_000           # (فقط مرجع؛ مسیر ربات تا ۱٫۸ گیگ کار می‌کند)
+GOLD_MIN       = 1_932_735_283        # = ۱٫۸ گیگابایتِ تلگرامی (1.8 × 1024³) — بالای این: اکانت‌خوان + طلایی
 BOT_UNAME = ""                     # یوزرنیم بات برای لینک دعوت؛ هنگام شروع پر می‌شود
 SPLIT_THRESHOLD= 1_900_000_000        # خروجی بزرگ‌تر از این خودکار قسمت می‌شود
 TAG_BIG        = {}                    # چت‌هایی که تگِ فایل >۲ گیگ در جریان دارند
@@ -258,6 +286,7 @@ MODE_LABEL = {
     "audio": "🎵 فقط صدا", "soft": "🖼 کم‌حجم", "strong": "🖼 خیلی کم‌حجم",
     "96": "🎵 صدا 96k",
     "turbo": "⚡ توربو (سریع‌ترین)",
+    "ultra": "⚡⚡ فوق‌سریع",
 }
 
 BTN_HELP = "📖 راهنما"
@@ -527,6 +556,35 @@ async def _file_job_guard(e):
 
 client.add_event_handler(_file_job_guard, events.NewMessage())
 PROCESS_START = time.time()
+# ⏳ سقف اجرای گیت‌هاب ۳۵۵ دقیقه است (زیر سقف ۶ ساعت). بدانیم چقدر مانده.
+RUN_LIMIT_S = int(os.environ.get("RUN_LIMIT_MIN", "335") or 335) * 60
+
+
+EXIT_MARKER = Path("/tmp/.run_deadline")
+
+
+def _deadline_reached() -> bool:
+    try:
+        return EXIT_MARKER.exists()
+    except Exception:
+        return False
+
+
+def _run_left() -> int:
+    """ثانیهٔ باقی‌مانده از این اجرا."""
+    try:
+        return max(0, int(RUN_LIMIT_S - (time.time() - PROCESS_START)))
+    except Exception:
+        return 0
+
+
+def _run_left_txt() -> str:
+    lft = _run_left()
+    if lft < 90:
+        return "کمتر از ۲ دقیقه"
+    if lft < 3600:
+        return f"~{round(lft / 60)} دقیقه"
+    return f"~{lft // 3600} ساعت و {round((lft % 3600) / 60)} دقیقه"
 
 
 # ═══════════ 🏷 اتاق تگ — گاردهای زودهنگام (دومین هندلر، قبل از همه‌ی بخش‌های دیگر) ═══════════
@@ -674,6 +732,141 @@ def _file_job_begin(chat_id, label="فایل", ttl=None):
 
 def _file_job_end(chat_id):
     FILE_JOB.pop(chat_id, None)
+
+
+# ── ♻️ وضعیت کارهای فایل، برای ادامه بعد از ری‌استارت ──
+RESUME_FILE = Path("/tmp/resume_jobs.json")
+CACHE_DIR = Path("/tmp/jobcache")          # فایل‌های دانلودشده/فشرده‌شده اینجا می‌مانند
+try:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+
+def _cache_path(name_tag, suffix=".bin"):
+    return str(CACHE_DIR / f"{name_tag}_{secrets.token_hex(3)}{suffix or '.bin'}")
+
+
+def _cache_prune(keep_bytes=int(os.environ.get("CACHE_KEEP_MB", "3000")) * 1024 * 1024):
+    """قبل از خاموش شدن: فقط خروجی‌های آماده را نگه دار.
+
+    فایل‌های *دانلودشده* حذف می‌شوند چون دوباره‌گرفتنشان از تلگرام ارزان است؛
+    آنچه ارزش دارد «خروجیِ فشرده‌شده» است که کدگذاری‌اش دقیقه‌ها وقت برده.
+    """
+    try:
+        d = _resume_load()
+        keep = set()
+        for j in d.values():
+            o = (j or {}).get("out")
+            if o and _file_ok(o, (j or {}).get("out_size") or 0):
+                keep.add(str(Path(str(o))))
+        total = 0
+        files = sorted(CACHE_DIR.glob("*"), key=lambda q: q.stat().st_size, reverse=True)
+        for f in files:
+            try:
+                sz = f.stat().st_size
+            except Exception:
+                continue
+            if str(f) in keep and total + sz <= keep_bytes:
+                total += sz
+                continue
+            try:
+                f.unlink()
+                log.info("cache: حذف %s (%.1fMB)", f.name, sz / 1048576)
+            except Exception:
+                pass
+        log.info("cache: %d فایل نگه داشته شد — %.1fMB (سقف %dMB)",
+                 len(keep), total / 1048576, keep_bytes // 1048576)
+        return total
+    except Exception:
+        return 0
+
+
+def _file_ok(path, size=0) -> bool:
+    """فایل هست و (اگر حجم انتظاری دادیم) حجمش تقریباً درست است؟"""
+    try:
+        p_ = Path(str(path))
+        if not p_.exists() or p_.stat().st_size <= 0:
+            return False
+        if size:
+            real = p_.stat().st_size
+            return abs(real - int(size)) <= max(1024, int(size) * 0.01)
+        return True
+    except Exception:
+        return False
+
+
+def _resume_load() -> dict:
+    try:
+        return json.loads(RESUME_FILE.read_text(encoding="utf-8") or "{}") or {}
+    except Exception:
+        return {}
+
+
+def _resume_save(d: dict):
+    try:
+        tmp = RESUME_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(RESUME_FILE)
+        persist.mark_dirty()
+    except Exception:
+        pass
+
+
+def _resume_set(chat_id, **kw):
+    d = _resume_load()
+    it = d.setdefault(str(chat_id), {})
+    it.update(kw)
+    it["ts"] = time.time()
+    _resume_save(d)
+
+
+def _resume_clear(chat_id):
+    d = _resume_load()
+    if d.pop(str(chat_id), None) is not None:
+        _resume_save(d)
+
+
+# ── 🔁 رسانه‌هایی که قبلاً پردازش شده‌اند (ضد تکرار بعد از ری‌استارت) ──
+SEEN_FILE = Path("/tmp/seen_media.json")
+
+
+def _seen_load() -> dict:
+    try:
+        return json.loads(SEEN_FILE.read_text(encoding="utf-8") or "{}") or {}
+    except Exception:
+        return {}
+
+
+def _seen_save(d: dict):
+    try:
+        tmp = SEEN_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d), encoding="utf-8")
+        tmp.replace(SEEN_FILE)
+        persist.mark_dirty()
+    except Exception:
+        pass
+
+
+def _seen_hit(chat_id, mid) -> bool:
+    try:
+        return int(mid) in set(_seen_load().get(str(chat_id)) or [])
+    except Exception:
+        return False
+
+
+def _seen_mark(chat_id, mid):
+    try:
+        d = _seen_load()
+        arr = d.setdefault(str(chat_id), [])
+        mid = int(mid)
+        if mid not in arr:
+            arr.append(mid)
+        if len(arr) > 800:
+            del arr[:-800]
+        _seen_save(d)
+    except Exception:
+        pass
 history = deque(maxlen=100)
 users_seen = {}          # str(id) → {name, uname, seen, jobs}
 DL_DLG = {}              # chat_id → {pairs, group, ts} نتیجهٔ جستجوی کانال/گروه
@@ -929,6 +1122,10 @@ def _ffmpeg_progress(cmd, prog=None, weight=(0.0, 1.0), duration=None, job=None)
 def compress_video(src: Path, dst: Path, mode: str, info: dict, prog: dict, job=None) -> Path:
     dur = max(info.get("duration") or 1, 1)
     src_mb = src.stat().st_size / 1024 / 1024
+    # ⚡ سرعت: اندازه‌گیری واقعی روی همین کد →
+    #    veryfast 720p = 1.00x | ultrafast 720p = 1.46x | ultrafast 480p = 1.74x
+    #    (روی رانر ۴ هسته‌ای، اختلاف بیشتر هم می‌شود). برای ویدیوهای بلند ultrafast.
+    _long = dur > 10 * 60
     # 🔒 سقفِ بیت‌ریت: خروجی هرگز از ۹۰٪ حجم اصلی بزرگ‌تر نشود
     src_kbps = int(src.stat().st_size * 8 / dur / 1000) if dur else 0
     cap_kbps = int(src_kbps * 0.90) if src_kbps else 0
@@ -940,7 +1137,7 @@ def compress_video(src: Path, dst: Path, mode: str, info: dict, prog: dict, job=
             return []
         return ["-maxrate", f"{v_cap}k", "-bufsize", f"{v_cap * 2}k"]
     # 🔧 سرعت محور: veryfast/superfast روی رانر چند برابر سریع‌تر از medium است؛ افت کیفیت در این کاربری ناچیز
-    preset = "veryfast" if dur <= 45 * 60 else "superfast"
+    preset = "ultrafast" if _long else "veryfast"
 
     def audio_for(total_kbps):
         return max(32, min(128, total_kbps // 3))
@@ -967,6 +1164,15 @@ def compress_video(src: Path, dst: Path, mode: str, info: dict, prog: dict, job=
             _ffmpeg_progress(cmd, prog, (0.0, 1.0), dur, job)
         return dst
 
+    if mode == "ultra":
+        # ⚡⚡ فوق‌سریع: ۴۸۰p + ultrafast + ۸۰۰k ویدیو — سریع‌ترین حالتِ واقعی
+        vcodec = ["-c:v", "libx264", "-preset", "ultrafast", "-b:v", "800k",
+                  "-x264-params", "rc-lookahead=0:ref=1:bframes=0:scenecut=0", *_cap(64)]
+        vf = ["-vf", "scale=-2:min(480\\,ih)"]
+        cmd = _video_cmd(src, dst, vcodec, vf, 64, faststart=False)
+        _ffmpeg_progress(cmd, prog, (0.0, 1.0), dur, job)
+        return dst
+
     if mode == "turbo":
         # ⚡ سریع‌ترین حالت ممکن: ultrafast + CRF بالا + ۴۸۰p + صدای سبک (تک‌گذره)
         vcodec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", *_cap(64)]
@@ -982,18 +1188,27 @@ def compress_video(src: Path, dst: Path, mode: str, info: dict, prog: dict, job=
         _ffmpeg_progress(cmd, prog, (0.0, 1.0), dur, job)
         return dst
 
-    vcodec = ["-c:v", "libx264", "-crf", "30", "-preset", "veryfast", *_cap(96)]
+    vcodec = ["-c:v", "libx264", "-crf", "30", "-preset", preset, *_cap(96)]
     vf = ["-vf", "scale=-2:min(480\\,ih)"]
     cmd = _video_cmd(src, dst, vcodec, vf, 96)
     _ffmpeg_progress(cmd, prog, (0.0, 1.0), dur, job)
     return dst
 
 
-def _video_cmd(src, dst, vcodec, vf, a_kbps) -> list:
-    return ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-threads", "0",
+def _video_cmd(src, dst, vcodec, vf, a_kbps, faststart=None) -> list:
+    """ساخت فرمان ffmpeg. faststart یک بازنویسیِ کل فایل است؛
+    برای خروجی‌های بزرگ (پیش‌فرض: >۳۰۰ مگ) حذف می‌شود تا وقت کم نشود."""
+    if faststart is None:
+        try:
+            faststart = (src.stat().st_size if hasattr(src, "stat") else 0) < 300 * 1024 * 1024
+        except Exception:
+            faststart = False
+    args = ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-threads", "0",
             "-i", str(src), *vcodec, *vf,
-            "-c:a", "aac", "-b:a", f"{a_kbps}k",
-            "-movflags", "+faststart", str(dst)]
+            "-c:a", "aac", "-b:a", f"{a_kbps}k"]
+    if faststart:
+        args += ["-movflags", "+faststart"]
+    return args + [str(dst)]
 
 
 def _two_pass(src, dst, vcodec, vf, a_kbps, prog, dur, job=None):
@@ -1219,6 +1434,57 @@ async def on_cancel_cb(e):
     await e.answer("در حال لغو…")
 
 
+@client.on(events.CallbackQuery(pattern=r"^(?:bargh|startup):toggle$"))
+async def season_cb(e):
+    """کلیدهای فصلی: مسدودسازی برق کاشان + گزارش روشن‌شدن."""
+    global BARGH_BLOCKED, STARTUP_REPORT
+    if e.sender_id not in ADMIN_IDS:
+        await e.answer("فقط مدیر.", alert=True)
+        return
+    data = e.data.decode("utf-8", "ignore")
+    if data.startswith("bargh:"):
+        BARGH_BLOCKED = not BARGH_BLOCKED
+        _runtime_flag_set("bargh_blocked", BARGH_BLOCKED)
+        if BARGH_BLOCKED:
+            n = 0
+            try:
+                n = bargha.cancel_all()
+            except Exception:
+                pass
+            txt = ("🚫 **بخش «برق کاشان» مسدود شد.**\n\n"
+                   "از این لحظه:\n"
+                   "• هیچ درخواستی به کانال‌های اطلاعیه نمی‌رود\n"
+                   "• هیچ یادآوری/اطلاعیه‌ای ارسال نمی‌شود\n"
+                   f"• {n} یادآوریِ زمان‌بندی‌شده لغو شد\n"
+                   "• دکمه‌اش برای همه (حتی تو) «⛔ فعلاً این امکان غیرفعال است.» می‌دهد\n\n"
+                   "برای آزاد کردن، همین دکمه را دوباره بزن.")
+            await e.answer("مسدود شد 🚫")
+        else:
+            txt = ("✅ **بخش «برق کاشان» آزاد شد.**\n"
+                   "حلقه‌ها دوباره روشن می‌شوند؛ چند دقیقه بعد اولین واکشی انجام می‌شود.")
+            await e.answer("آزاد شد ✅")
+            try:
+                client.loop.call_soon(lambda: asyncio.ensure_future(bargha.poll_loop(client)))
+                client.loop.call_soon(lambda: asyncio.ensure_future(bargha.freshness_loop(client)))
+                client.loop.call_soon(lambda: asyncio.ensure_future(bargha.nightly_loop(client)))
+            except Exception:
+                pass
+    else:
+        STARTUP_REPORT = not STARTUP_REPORT
+        _runtime_flag_set("startup_report", STARTUP_REPORT)
+        txt = ("🔔 از این پس هر بار ربات روشن شود، یک پیام وضعیت برایت می‌آید."
+               if STARTUP_REPORT else
+               "🔕 گزارش روشن‌شدن خاموش شد — ری‌استارت‌های خودکار پیامی نمی‌فرستند.")
+        await e.answer("تغییر کرد")
+    try:
+        await e.edit(txt, buttons=[[Button.inline("⚙️ قابلیت‌ها", b"a:feat")],
+                                   [Button.inline("🔙 پنل", b"a:menu")]])
+    except Exception:
+        await client.send_message(e.chat_id, txt,
+                                  buttons=[[Button.inline("🔙 پنل", b"a:menu")]])
+    raise events.StopPropagation
+
+
 @client.on(events.CallbackQuery(pattern=r"^job:"))
 async def job_reset_cb(e):
     """آزادسازی دستیِ قفلِ فایل (اگر کاری گیر کرده باشد)."""
@@ -1236,6 +1502,7 @@ async def job_reset_cb(e):
     busy[chat] = False
     pending.pop(str(chat), None)
     save_pending()
+    _resume_clear(chat)
     try:
         await e.answer("آزاد شد ✅", alert=True)
     except Exception:
@@ -2225,7 +2492,7 @@ async def _dl_deliver(chat_id, uc, mode, entity, msg, group_mode=False):
             return
         if size > ACCEPT_MAX and not is_gold(chat_id):
             await client.send_message(
-                chat_id, "👑 تحویل فایل بالای ۲ گیگابایت نیازمند «اکانت طلایی» است.\n"
+                chat_id, f"👑 تحویل فایل بالای {CAP_TEXT} نیازمند «اکانت طلایی» است.\n"
                          "رایگان طلایی شو: دکمهٔ «👤 اطلاعات من» لینک دعوتت را نشان می‌دهد (سه نفر)، یا به پشتیبانی پیام بده.")
             return
         ent_title = (getattr(entity, "title", None)
@@ -2767,10 +3034,10 @@ async def on_tag_file(e):
     TAG_BIG.pop(e.chat_id, None)
     if _tsize > ACCEPT_MAX:
         if not (globals().get("user_client") and user_client.is_connected()):
-            await e.reply("⚠️ برای تگِ فایل بالای ۲ گیگ باید «اکانت‌خوان» وصل باشد (مدیر: `/login`) یا فایل زیر سقف بفرست.")
+            await e.reply(f"⚠️ برای تگِ فایل بالای {CAP_TEXT} باید «اکانت‌خوان» وصل باشد (مدیر: `/login`) یا فایل زیر سقف بفرست.")
             raise events.StopPropagation
         if not is_gold(e.sender_id):
-            await e.reply("👑 تگ کردن فایل بالای ۲ گیگابایت به «اکانت طلایی» نیاز دارد.\n"
+            await e.reply(f"👑 تگ کردن فایل بالای {CAP_TEXT} به «اکانت طلایی» نیاز دارد.\n"
                           "رایگان طلایی شو: سه نفر را با لینک خودت بیاور (دکمهٔ «👤 اطلاعات من») یا به پشتیبانی پیام بده.",
                           buttons=[[Button.inline("📊 وضعیت من / لینک دعوت", b"me:open")]])
             raise events.StopPropagation
@@ -2803,6 +3070,8 @@ async def _tag_run(chat_id, m, new_name, thumb_msg=None):
         return
     TAG_BUSY[chat_id] = True
     _file_job_begin(chat_id, (m.file.name if m.file else "فایل"), ttl=FILE_JOB_TTL)
+    _resume_set(chat_id, kind="tag", step="running", msg_id=getattr(m, "id", 0),
+                name=new_name or "فایل")
     status = None
     tmpdir = None
     try:
@@ -2951,6 +3220,7 @@ async def _tag_run(chat_id, m, new_name, thumb_msg=None):
     finally:
         TAG_BUSY.pop(chat_id, None)
         _file_job_end(chat_id)
+        _resume_clear(chat_id)
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -8778,7 +9048,7 @@ async def cmd_link(e):
         await e.reply("❌ روی فایل ریپلای کن (نه متن).")
         return
     if (r_.file.size or 0) > ACCEPT_MAX:
-        await e.reply(f"⚠️ سقف عملی {CAP_TEXT} است؛ تلگرام هم بالاتر از ~۲ گیگ را منتقل نمی‌کند.")
+        await e.reply(f"⚠️ سقف عملی {CAP_TEXT} است؛ تلگرام هم بالاتر از این را منتقل نمی‌کند.")
         return
     st = await e.reply("⏳ دارم آپلود می‌کنم… (ممکن است کمی طول بکشد)")
     try:
@@ -9242,6 +9512,10 @@ def _admin_kb():
         [Button.inline("👥 کاربران", b"a:users")],
         [Button.inline("👑 طلایی — جستجو/فعال‌سازی", b"a:gold")],
         [Button.inline("⚙️ قابلیت‌های روشن/خاموش", b"a:feat")],
+        [Button.inline("🚫 برق کاشان: مسدود" if not BARGH_BLOCKED
+                       else "✅ برق کاشان: آزاد", b"bargh:toggle"),
+         Button.inline("🔔 گزارش روشن‌شدن: " + ("روشن" if STARTUP_REPORT else "خاموش"),
+                       b"startup:toggle")],
         [Button.inline("📡 لیست پروکسی/کانفیگ", b"a:anten")],
         [Button.inline("🖥 اکانت‌خوان (وصل/قطع)", b"a:login")],
         [Button.inline("🏛 تنظیم گروه مای‌ربات", b"a:groupinfo")],
@@ -10345,20 +10619,11 @@ async def on_file(e):
     # پس هر فایل بزرگ‌تر باید از مسیر «گروه کمکی + اکانت‌خوان» برود.
     _uc_ok = bool(globals().get("user_client") and user_client.is_connected())
     _grp_ok = bool((((GROUP_CFG or {}).get("media") or {}).get("chat")))
-    USE_BIG = size > ACCEPT_MAX or (size > BOT_DL_MAX and _uc_ok and _grp_ok)
-    if size > BOT_DL_MAX and not USE_BIG:
-        await e.reply(
-            "⚠️ این فایل از سقف دانلودِ ربات در تلگرام (~۲۰ مگابایت) بزرگ‌تر است.\n\n"
-            "دو راه:\n"
-            "① مدیر `/login` بزند و اکانت‌خوان را وصل کند، و گروه کمکی هم تنظیم باشد "
-            "(بعد از آن هر حجمی تا ۴ گیگ از همین‌جا پذیرفته می‌شود)؛\n"
-            "② یا فایل را جایی آپلود کن و لینک بده: `/zlink https://…`",
-            buttons=[[Button.inline("🔗 راهنمای اتصال اکانت", b"help:reader")],
-                     [Button.inline("🌐 روش لینک", b"help:zlink")]])
-        return
+    # تا ۱٫۸ گیگ: رایگان و بدون اکانت‌خوان (خودِ ربات دانلود می‌کند)
+    USE_BIG = size > GOLD_MIN
     if USE_BIG:
         if not _uc_ok:
-            await e.reply("⚠️ فایل بالای ~۲ گیگ فقط وقتی پردازش می‌شود که «اکانت‌خوان» وصل باشد (رایگان هم کافیست؛ پرمیوم فقط سریع‌تر).\n"
+            await e.reply(f"⚠️ فایل بالای {CAP_TEXT} فقط وقتی پردازش می‌شود که «اکانت‌خوان» وصل باشد.\n"
                           "① مدیر `/login` را بزند و یک اکانت وصل کند؛\n"
                           "② یا بدون هیچ اکانتی، فایل را جایی آپلود کن و لینکش را بده:\n"
                           "   /zlink <آدرس مستقیم دانلود>  ← از اینترنت سرور گرفته می‌شود.",
@@ -10368,7 +10633,8 @@ async def on_file(e):
         if not is_gold(e.sender_id):
             _rl = _ref_link(e.sender_id)
             await e.reply(
-                "👑 این فایل بالای ۲ گیگابایت است؛ پردازش آن به «اکانت طلایی» نیاز دارد.\n\n"
+                f"👑 این فایل بالای {CAP_TEXT} است؛ پردازش آن به «اکانت طلایی» نیاز دارد.\n"
+                f"(فایل‌های تا {CAP_TEXT} برای همه رایگان و بدون اکانت‌خوان انجام می‌شود.)\n\n"
                 "**رایگان طلایی شو:**\n"
                 f"① سه نفر را با لینک خودت به ربات بیاور:\n{_rl}\n"
                 "② یا به پشتیبانی پیام بده تا برایت فعال کنند.\n\n"
@@ -10409,6 +10675,8 @@ async def on_file(e):
     jobs[str(chat_id)] = {"name": name, "size": size, "kind": kind,
                           "status": "در انتظار انتخاب کاربر"}
     _file_job_begin(chat_id, name, ttl=FILE_JOB_TTL)
+    _resume_set(chat_id, kind="compress", step="ask", mode="",
+                msg_id=e.message.id, size=size, fkind=kind, name=name)
     _dur, _w, _h, _fps = _media_meta(e.message)
     rows, note = _mode_rows(kind, size, _dur, _w, _h, _fps)
     if not rows:
@@ -10431,6 +10699,7 @@ async def on_file(e):
         f"📦 حجم فعلی: **{fmt_size(size)}**" + (f"\n{_meta_txt}" if _meta_txt else "") + "\n\n"
         "⚡ **چقدر کم‌حجمش کنم؟** 👇 (برآورد حجم نهایی روی هر دکمه نوشته شده)\n"
         "بعد از انتخاب، دانلود شروع می‌شود — تا آن لحظه هیچ ترافیکی مصرف نمی‌شود."
+        + (f"\n\n⏳ از این اجرای ربات {_run_left_txt()} مانده." if _run_left() < 3000 else "")
         + note,
         buttons=rows)
 
@@ -10470,6 +10739,8 @@ def _est_out(size, dur, kind, mode, w=0, h=0, fps=25.0):
                 return int(size * frac * eff)
             if mode == "audio":
                 return int(96_000 / 8 * dur) if dur else None
+            if mode == "ultra":
+                return int((800 + 64) * 1000 * dur / 8) if dur else None
             cap_h = {"turbo": 480, "480": 480, "quality": 1080}.get(mode)
             if not cap_h or not dur:
                 return None
@@ -10495,13 +10766,53 @@ def _fmt_est(b):
     return f"≈{max(1, round(b / 1024 ** 2))}MB"
 
 
+# سرعت واقعیِ کدگذاری روی رانر ۴ هسته‌ای (برابرِ زمانِ واقعی ویدیو)
+_EST_SPEED = {"ultra": 9.0, "turbo": 7.0, "480": 7.0, "half": 5.0,
+              "quarter": 5.0, "quality": 4.0, "hevc": 1.5, "audio": 30.0}
+
+
+def _est_time(size, dur, mode, kind=KIND_VIDEO):
+    """تخمین زمان کل (ثانیه): دانلود + کدگذاری + آپلود."""
+    try:
+        dl = size / (12 * 1024 * 1024.0)             # با cryptg ~۱۲MB/s
+        enc = (dur / _EST_SPEED.get(mode, 4.0)) if kind == KIND_VIDEO else (size / (40e6))
+        new = _est_out(size, dur, kind, mode) or size * 0.5
+        up = new / (10 * 1024 * 1024.0)
+        return max(20.0, dl + enc + up)
+    except Exception:
+        return None
+
+
+def _fmt_time(sec):
+    if not sec:
+        return "?"
+    sec = int(sec)
+    if sec < 90:
+        return f"{sec} ثانیه"
+    if sec < 3600:
+        return f"~{round(sec / 60)} دقیقه"
+    return f"~{sec // 3600}ساعت و {round((sec % 3600) / 60)}دقیقه"
+
+
+def _mode_labels_extra(mode, size, dur, kind):
+    parts = []
+    est = _est_out(size, dur, kind, mode)
+    if est:
+        parts.append(_fmt_est(est))
+    t = _est_time(size, dur, mode, kind)
+    if t:
+        parts.append("⏱" + _fmt_time(t))
+    return (" · ".join(parts))
+
+
 def _mode_rows(kind, size=0, dur=0, w=0, h=0, fps=25.0):
     """دکمه‌های «چقدر کم‌حجم کنم؟» + برآورد حجم روی هر دکمه.
     حالت‌هایی که حجم را بزرگ‌تر می‌کنند اصلاً نشان داده نمی‌شوند.
     خروجی: (rows, note)"""
     rows, grown, ests = [], [], []
     if kind == KIND_VIDEO:
-        spec = [("turbo", "⚡ توربو (سریع)"),
+        spec = [("ultra", "⚡⚡ فوق‌سریع"),
+                ("turbo", "⚡ توربو (سریع)"),
                 ("half", "🎯 نصف حجم"),
                 ("quarter", "📦 یک‌چهارم"),
                 ("quality", "✨ کمترین افت"),
@@ -10519,7 +10830,8 @@ def _mode_rows(kind, size=0, dur=0, w=0, h=0, fps=25.0):
             grown.append(label)
             continue
         cb = _cb_prefix(kind, mode).encode()
-        txt = f"{label} → {_fmt_est(est)}" if est else label
+        extra = _mode_labels_extra(mode, size, dur, kind)
+        txt = f"{label} → {extra}" if extra else label
         rows.append([Button.inline(txt, cb)])
         if est:
             ests.append(est)
@@ -10545,6 +10857,15 @@ def _cb_prefix(kind, mode):
 async def _pending_download(e, chat_id, req):
     """دانلودِ فایلِ در انتظار — *بعد از* انتخاب «چقدر کم‌حجم کنم».
     پیشرفت زنده + لغوِ واقعی (کنسل کردن تسک/کشتن ffmpeg). خروجی True/False."""
+    # ♻️ اگر همان فایل قبلاً دانلود شده و روی دیسک است، دوباره دانلود نکن
+    if req.get("src") and _file_ok(req.get("src"), req.get("size") or 0):
+        log.info("cache: استفادهٔ دوباره از فایل دانلودشده %s", req.get("src"))
+        try:
+            if not req.get("info"):
+                req["info"] = ffprobe(Path(str(req["src"])))
+            return True
+        except Exception:
+            pass
     try:
         msg = await client.get_messages(int(req.get("chat") or chat_id),
                                        ids=int(req.get("msg_id") or 0))
@@ -10563,7 +10884,7 @@ async def _pending_download(e, chat_id, req):
     uc = globals().get("user_client")
     _uc_ok = bool(uc and uc.is_connected())
     _grp_ok = bool((((GROUP_CFG or {}).get("media") or {}).get("chat")))
-    use_big = size > ACCEPT_MAX or (size > BOT_DL_MAX and _uc_ok and _grp_ok)
+    use_big = size > GOLD_MIN
 
     st = {"cur": 0, "total": size, "t0": time.time()}
     cjob = {"proc": None, "cancel": False}
@@ -10577,9 +10898,10 @@ async def _pending_download(e, chat_id, req):
         if use_big:
             return await _big_ingest_download(msg, st)
         return await msg.download_media(
-            file=str(WORKDIR),
+            file=_cache_path(f"src{chat_id}"),
             progress_callback=lambda c, t: st.update(cur=c, total=t))
 
+    _t_dl0 = time.time()
     task = asyncio.create_task(dl())
     last_cur, last_move = 0, time.time()
     try:
@@ -10641,7 +10963,7 @@ async def _pending_download(e, chat_id, req):
             pass
         return False
     mime = ((getattr(msg, "file", None) and (msg.file.mime_type or "")) or "").lower()
-    if (info.get("video") or mime.startswith("audio/")) and not FFMPEG_OK:
+    if (info.get("video") or mime.startswith("audio/")) and not _ffmpeg_ready():
         path.unlink(missing_ok=True)
         pending.pop(str(chat_id), None)
         save_pending()
@@ -10654,8 +10976,16 @@ async def _pending_download(e, chat_id, req):
 
     req["src"] = str(path)
     req["info"] = info
+    try:
+        req["t_dl"] = round(time.time() - _t_dl0, 1)
+    except Exception:
+        pass
     pending[str(chat_id)] = req
     save_pending()
+    try:
+        _resume_set(chat_id, src=str(path), src_size=int(req.get("size") or 0))
+    except Exception:
+        pass
     return True
 
 
@@ -10687,8 +11017,39 @@ async def on_button(e):
         return
 
     await e.answer()
+    # ⏳ اگر تخمین کار از عمرِ باقی‌ماندهٔ اجرا بیشتر است، هشدار بده (فقط یک‌بار)
+    if not req.get("force"):
+        try:
+            _est_s = _est_time(int(req.get("size") or 0),
+                               int((req.get("info") or {}).get("duration") or 0) or 3600,
+                               mode, kind) or 0
+            _left = _run_left()
+            if _est_s and _left and _est_s > _left * 0.95:
+                pending[str(chat_id)] = req
+                save_pending()
+                await e.answer("⏳ زمان کم است", alert=True)
+                await e.edit(
+                    f"⏳ **این کار از عمرِ این اجرا بیشتر است.**\n\n"
+                    f"🎛 حالت: {MODE_LABEL.get(mode, mode)}\n"
+                    f"⏱ تخمین کار: {_fmt_time(_est_s)}\n"
+                    f"⏳ باقی‌ماندهٔ اجرا: {_run_left_txt()}\n\n"
+                    "اگر همین حالا شروع کنم، احتمالاً وسط کار ری‌استارت می‌شود "
+                    "(بعدش با «▶️ ادامه بده» خودکار ادامه می‌دهم).\n"
+                    "پیشنهاد: حالت «⚡⚡ فوق‌سریع» را بزن تا در همین اجرا تمام شود.",
+                    buttons=[[Button.inline("▶️ با همین ریسک شروع کن",
+                                            f"gof:{chat_id}:{mode}".encode())],
+                             [Button.inline("⚡⚡ فوق‌سریع", b"v:ultra")],
+                             [Button.inline("✖ لغو", b"x:cancel")]])
+                pending[str(chat_id)]["force"] = False
+                save_pending()
+                return
+        except Exception:
+            pass
     busy[chat_id] = True
     _file_job_begin(chat_id, req.get("name") or "فایل", ttl=FILE_JOB_TTL)
+    _resume_set(chat_id, kind="compress", step="running", mode=mode,
+                msg_id=req.get("msg_id"), size=req.get("size"),
+                fkind=kind, name=req.get("name") or "فایل")
     if not req.get("src"):
         if not await _pending_download(e, chat_id, req):
             busy[chat_id] = False
@@ -10698,6 +11059,24 @@ async def on_button(e):
     src = Path(req["src"])
     old_size = req["size"]
     info = req["info"]
+
+    # ♻️ اگر همین فایل قبلاً فشرده شده و خروجی روی دیسک مانده، فقط آپلود کن
+    if req.get("out") and _file_ok(req.get("out"), req.get("out_size") or 0):
+        try:
+            await e.edit("♻️ فشرده‌سازیِ قبلی پیدا شد — فقط ارسال می‌کنم (بدون کدگذاری مجدد)…")
+        except Exception:
+            pass
+        ok_send = await _deliver_cached(chat_id, req["out"], old_size, req.get("name") or "فایل")
+        if ok_send:
+            _resume_clear(chat_id)
+            for _p in (req.get("out"), req.get("src")):
+                try:
+                    Path(str(_p)).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        busy[chat_id] = False
+        _file_job_end(chat_id)
+        return
     base = str(WORKDIR / f"out_{chat_id}_{int(time.time() * 1000)}")
     out = None
     start = time.time()
@@ -10758,6 +11137,10 @@ async def on_button(e):
             return
 
         new_size = out.stat().st_size
+        try:
+            _resume_set(chat_id, step="upload", out=str(out), out_size=int(new_size))
+        except Exception:
+            pass
         # 🔒 گارد: فایلی که از قبل فشرده بوده → خروجی بزرگ‌تر/هم‌اندازه می‌شود
         if old_size and new_size >= old_size * 0.97:
             try:
@@ -10768,6 +11151,7 @@ async def on_button(e):
                     "پس **نسخهٔ اصلی و دست‌نخورده** را برایت می‌فرستم 👇")
             except Exception:
                 pass
+            _job_done = True
             try:
                 await client.send_file(
                     chat_id, str(src),
@@ -10804,7 +11188,34 @@ async def on_button(e):
                     oi = await asyncio.to_thread(ffprobe, part_path)
                     kwargs.update(attributes=[DocumentAttributeAudio(
                         int(oi["duration"] or 1), title=req["name"][:60])])
-                m_ = await client.send_file(chat_id, str(part_path), **kwargs)
+                stored = None
+                _cfg_m = GROUP_CFG.get("media") or {}
+                if _cfg_m.get("chat"):
+                    try:
+                        stored = await client.send_file(
+                            _cfg_m["chat"], str(part_path),
+                            reply_to=_cfg_m.get("topic"), **kwargs)
+                    except Exception as ex:
+                        log.warning("store-to-group: %s", str(ex)[:120])
+                        stored = None
+                if stored is not None:
+                    try:
+                        _ids = list((_resume_load().get(str(chat_id)) or {}).get("store_ids") or [])
+                        _ids.append(stored.id)
+                        _resume_set(chat_id, store_chat=_cfg_m["chat"], store_ids=_ids)
+                    except Exception:
+                        pass
+                    m_ = await _copy_media_to(chat_id, stored, part_cap[:1024])
+                    if m_ is None:                      # اگر کپی نشد، مسیر معمولی
+                        m_ = await client.send_file(chat_id, str(part_path), **kwargs)
+                    else:
+                        try:                            # گروه شلوغ نشود
+                            await client.delete_messages(_cfg_m["chat"], [stored.id])
+                            _resume_set(chat_id, store_ids=[], store_chat=None)
+                        except Exception:
+                            pass
+                else:
+                    m_ = await client.send_file(chat_id, str(part_path), **kwargs)
                 sent_msgs.append(m_)
                 results.append(m_)
             return results[-1] if results else None
@@ -10812,6 +11223,7 @@ async def on_button(e):
         sent_msgs = []
 
         # 🔧 فیکس: تعریف تکراریِ ناقص send() حذف شد — send_task گم شده بود
+        _t_up0 = time.time()
         send_task = asyncio.create_task(send())
         try:
             s_last_cur, s_last_move = 0, time.time()
@@ -10899,9 +11311,15 @@ async def on_button(e):
 
         el = int(time.time() - start)
         dur_txt = f"{el // 60}:{el % 60:02d}"
+        _t_dl = float(req.get("t_dl") or 0)
+        _t_up = time.time() - locals().get("_t_up0", time.time())
+        _t_enc = max(0.0, el - _t_dl - _t_up)
+        _speed_txt = (f"\n⏱ دریافت {_fmt_time(_t_dl)} · فشرده‌سازی {_fmt_time(_t_enc)}"
+                      f" · ارسال {_fmt_time(_t_up)}") if _t_dl else ""
         await e.edit(f"✅ تمام شد! ({dur_txt})\n🗜 {fmt_size(old_size)} ← {fmt_size(new_size)}"
-                     + (f" (کاهش {pct_red}%)" if pct_red > 0 else "") 
-                     + (f"\n📦 در {len(parts)} قسمت ارسال شد" if len(parts) > 1 else ""))
+                     + (f" (کاهش {pct_red}%)" if pct_red > 0 else "")
+                     + (f"\n📦 در {len(parts)} قسمت ارسال شد" if len(parts) > 1 else "")
+                     + _speed_txt)
 
         u = users_seen.get(str(chat_id), {})
         history.append({
@@ -10915,6 +11333,7 @@ async def on_button(e):
             users_seen.get(str(chat_id), {}).get("jobs", 0) + 1
         save_users()
         jobs[str(chat_id)]["status"] = "تمام شد"
+        _job_done = True
         pending.pop(str(chat_id), None)
         pending.pop(chat_id, None)
         save_pending()
@@ -10924,14 +11343,291 @@ async def on_button(e):
         busy[chat_id] = False
         _file_job_end(chat_id)
         pending.pop(str(chat_id), None)
-        for p in ([src, out] + list(locals().get("parts", []))):
-            if p:
-                try:
-                    Path(str(p)).unlink(missing_ok=True)
-                except OSError:
-                    pass
+        # ♻️ اگر کار کامل نشد، فایل‌ها می‌مانند تا بعد از ری‌استارت دوباره دانلود/کدگذاری نشوند
+        if locals().get("_job_done"):
+            _resume_clear(chat_id)
+            for p in ([src, out] + list(locals().get("parts", []))):
+                if p:
+                    try:
+                        Path(str(p)).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+        else:
+            log.info("cache: فایل‌های کارِ نیمه‌کاره نگه داشته شد (chat=%s)", chat_id)
 
 
+
+
+# ══════════════════════════════════════════════════════════════════
+# ♻️ ادامهٔ کارِ نیمه‌کاره پس از ری‌استارت
+#    فایل هر کاربر (کم‌حجم/تگ) با شناسهٔ پیام و مرحله‌اش ذخیره می‌شود؛
+#    بعد از روشن شدن، به کاربر و ادمین دکمهٔ «▶️ ادامه بده» می‌رسد.
+# ══════════════════════════════════════════════════════════════════
+async def _copy_media_to(dst_chat, src_msg, caption=None):
+    """کپیِ سرور-سایدِ یک رسانه (بدون آپلود مجدد و بدون هدر «فوروارد»).
+
+    از InputMediaDocument/InputMediaPhoto استفاده می‌کند؛ تلگرام خودش نسخه را
+    برای مقصد می‌سازد. یعنی «آپلود یک‌بار، تحویل چندبار».
+    """
+    try:
+        from telethon.tl.types import (InputMediaDocument, InputDocument,
+                                       InputMediaPhoto, InputPhoto)
+        d = getattr(src_msg, "document", None)
+        ph = getattr(src_msg, "photo", None)
+        if d is not None:
+            media = InputMediaDocument(
+                InputDocument(id=d.id, access_hash=d.access_hash,
+                              file_reference=d.file_reference), caption=caption)
+        elif ph is not None:
+            media = InputMediaPhoto(
+                InputPhoto(id=ph.id, access_hash=ph.access_hash,
+                           file_reference=ph.file_reference), caption=caption)
+        else:
+            return None
+        return await client.send_file(dst_chat, media)
+    except Exception as ex:
+        log.warning("copy_media: %s", str(ex)[:150])
+        return None
+
+
+async def _deliver_cached(chat_id, out_path, old_size, name="فایل") -> bool:
+    """ارسالِ خروجیِ فشرده‌شده‌ای که از قبل روی دیسک مانده (بدون کدگذاری مجدد)."""
+    try:
+        p_ = Path(str(out_path))
+        if not p_.exists():
+            return False
+        new_size = p_.stat().st_size
+        parts = _split_if_needed(p_)
+        pct = int((1 - new_size / old_size) * 100) if old_size else 0
+        cap = f"🗜 {fmt_size(old_size)} ← {fmt_size(new_size)}" + \
+              (f" (کاهش {pct}%)" if pct > 0 else "")
+        ok = False
+        for i, part in enumerate(parts, 1):
+            c_ = cap + (f"\n📦 قسمت {i}/{len(parts)}" if len(parts) > 1 else "")
+            try:
+                await client.send_file(chat_id, str(part), caption=c_[:1024])
+                ok = True
+            except Exception as ex:
+                log.warning("deliver cached: %s", str(ex)[:120])
+        return ok
+    except Exception as ex:
+        log.warning("deliver cached outer: %s", str(ex)[:120])
+        return False
+
+
+class _ResumeEv:
+    """رویدادِ مصنوعی تا جریانِ فشرده‌سازی بدون تغییر دوباره اجرا شود."""
+
+    def __init__(self, data: str, chat_id: int):
+        self.data = data.encode()
+        self.chat_id = chat_id
+        self.sender_id = chat_id
+        self._msg = None
+
+    async def answer(self, *a, **k):
+        return None
+
+    async def edit(self, text="", buttons=None, **kw):
+        try:
+            if self._msg is None:
+                self._msg = await client.send_message(self.chat_id, text, buttons=buttons)
+                return self._msg
+            return await self._msg.edit(text, buttons=buttons)
+        except Exception:
+            return None
+
+
+_RESUME_TITLES = {"compress": "🗜 کم‌حجم کردن", "tag": "🏷 تگ فایل"}
+
+
+async def _resume_startup():
+    """به کاربر و ادمین‌ها خبر بده که کاری نیمه‌کاره مانده + دکمهٔ ادامه."""
+    d = _resume_load()
+    if not d:
+        return
+    for chat_s, j in list(d.items()):
+        try:
+            chat = int(chat_s)
+        except Exception:
+            continue
+        title = _RESUME_TITLES.get(j.get("kind"), "📎 فایل")
+        nm = (j.get("name") or "فایل")[:40]
+        sz = ""
+        try:
+            sz = fmt_size(int(j.get("size") or 0)) if j.get("size") else ""
+        except Exception:
+            sz = ""
+        txt = (f"♻️ ربات ری‌استارت شد و کارِ **{title}** نیمه‌کاره ماند.\n"
+               f"📄 {nm}" + (f" — {sz}" if sz else "") + "\n\n"
+               "با «▶️ ادامه بده» از همان‌جا ادامه می‌دهم "
+               "(فایل دوباره از تلگرام گرفته می‌شود، لازم نیست خودت بفرستی).")
+        kb = [[Button.inline("▶️ ادامه بده", f"res:{chat}".encode())],
+              [Button.inline("✖ لازم نیست", f"rsx:{chat}".encode())]]
+        targets = [chat] + [int(a) for a in ADMIN_IDS]
+        sent = set()
+        for t in targets:
+            if t in sent:
+                continue
+            sent.add(t)
+            msg_txt = txt if t == chat else (txt + f"\n\n👤 کاربر: `{chat}`")
+            try:
+                await client.send_message(t, msg_txt, buttons=kb)
+            except Exception:
+                pass
+        log.info("resume: اعلان ادامه برای %s (%s)", chat, j.get("kind"))
+
+
+@client.on(events.CallbackQuery(pattern=r"^(?:res|rsx):"))
+async def resume_cb(e):
+    if not isinstance(e.data, (bytes, bytearray)):
+        return
+    data = e.data.decode("utf-8", "ignore")
+    try:
+        chat = int(data.split(":", 1)[1])
+    except Exception:
+        return
+    if e.sender_id not in ADMIN_IDS and e.sender_id != chat:
+        await e.answer("این دکمه برای خود کاربر است.", alert=True)
+        return
+    if data.startswith("rsx:"):
+        _resume_clear(chat)
+        pending.pop(str(chat), None)
+        save_pending()
+        try:
+            await e.answer("باشه، پاک شد")
+            await e.edit("✖ ادامهٔ این کار لازم نیست.", buttons=None)
+        except Exception:
+            pass
+        raise events.StopPropagation
+
+    j = _resume_load().get(str(chat))
+    if not j:
+        await e.answer("چیزی برای ادامه نیست.", alert=True)
+        return
+    await e.answer("در حال ادامه…")
+
+    # پیامِ اصلی فایل را از تلگرام دوباره بگیر (پیام‌ها بعد از ری‌استارت می‌مانند)
+    msg = None
+    try:
+        msg = await client.get_messages(chat, ids=int(j.get("msg_id") or 0))
+    except Exception:
+        msg = None
+    if not msg or not (getattr(msg, "media", None) or getattr(msg, "file", None)):
+        _resume_clear(chat)
+        try:
+            await e.edit("⌛ فایلِ قبلی پیدا نشد (شاید پاک شده) — لطفاً دوباره بفرست.", buttons=None)
+        except Exception:
+            pass
+        raise events.StopPropagation
+
+    kind_ = j.get("kind") or "compress"
+    if kind_ == "tag":
+        _resume_clear(chat)
+        try:
+            await e.edit("▶️ ادامهٔ تگ شروع شد…", buttons=None)
+        except Exception:
+            pass
+        asyncio.ensure_future(_tag_run(chat, msg, j.get("name") or "فایل"))
+        raise events.StopPropagation
+
+    # ⚡ اگر نسخهٔ آپلودشده در گروه تلگرام مانده باشد → کپیِ فوری (بدون آپلود/کدگذاری)
+    if j.get("store_ids") and j.get("store_chat"):
+        try:
+            await e.edit("⚡ نسخهٔ آماده در تلگرام پیدا شد — فقط کپی می‌کنم…", buttons=None)
+        except Exception:
+            pass
+        done_any = False
+        for mid_s in j.get("store_ids") or []:
+            try:
+                src_m = await client.get_messages(int(j["store_chat"]), ids=int(mid_s))
+                if src_m:
+                    got = await _copy_media_to(chat, src_m)
+                    done_any = done_any or bool(got)
+                    try:
+                        await client.delete_messages(int(j["store_chat"]), [int(mid_s)])
+                    except Exception:
+                        pass
+            except Exception as ex:
+                log.warning("resume-store-copy: %s", str(ex)[:120])
+        if done_any:
+            _resume_clear(chat)
+            try:
+                await client.send_message(chat, "✅ ارسال شد (کپی فوری از نسخهٔ ذخیره‌شده).")
+            except Exception:
+                pass
+            raise events.StopPropagation
+
+    # ♻️ اگر فشرده‌سازی قبلاً تمام شده و فقط ارسال مانده
+    if j.get("out") and _file_ok(j.get("out"), j.get("out_size") or 0):
+        try:
+            await e.edit("♻️ نتیجهٔ فشرده‌سازی از قبل آماده است — فقط ارسال می‌کنم…", buttons=None)
+        except Exception:
+            pass
+        ok_ = await _deliver_cached(chat, j["out"], int(j.get("size") or 0), j.get("name") or "فایل")
+        if ok_:
+            try:
+                Path(str(j["out"])).unlink(missing_ok=True)
+            except Exception:
+                pass
+            _resume_clear(chat)
+        raise events.StopPropagation
+
+    # کم‌حجم‌سازی
+    fk = j.get("fkind") or KIND_VIDEO
+    size_ = int(j.get("size") or 0)
+    if not size_:
+        try:
+            size_ = int((getattr(msg, "file", None) and msg.file.size) or 0)
+        except Exception:
+            size_ = 0
+    pending[str(chat)] = {"msg_id": msg.id, "chat": chat, "src": None, "size": size_,
+                          "kind": fk, "info": None, "name": j.get("name") or "فایل",
+                          "ts": time.time()}
+    save_pending()
+    mode = (j.get("mode") or "").strip()
+    if mode:
+        letter = "v" if fk == KIND_VIDEO else ("i" if fk == KIND_IMAGE else "a")
+        try:
+            await e.edit("▶️ ادامه از همان مرحله…", buttons=None)
+        except Exception:
+            pass
+        busy[chat] = False
+        await on_button(_ResumeEv(f"{letter}:{mode}", chat))
+    else:
+        _dur, _w, _h, _fps = _media_meta(msg)
+        rows, note = _mode_rows(fk, size_, _dur, _w, _h, _fps)
+        txt = (f"📄 فایل پیدا شد: **{(j.get('name') or 'فایل')[:45]}**\n"
+               f"📦 حجم: **{fmt_size(size_)}**\n\n"
+               "مرحلهٔ قبلی «انتخاب میزان کم‌حجم‌سازی» بود — دوباره انتخاب کن:"
+               + note)
+        try:
+            await e.edit(txt, buttons=rows)
+        except Exception:
+            await client.send_message(chat, txt, buttons=rows)
+    raise events.StopPropagation
+
+
+@client.on(events.CallbackQuery(pattern=r"^gof:"))
+async def go_force_cb(e):
+    """شروع با آگاهی از ریسکِ ری‌استارت وسط کار."""
+    try:
+        _d = e.data.decode("utf-8", "ignore").split(":")
+        chat = int(_d[1]); mode = _d[2]
+    except Exception:
+        return
+    req = pending.get(str(chat))
+    if not req:
+        await e.answer("فایل منقضی شده — دوباره بفرست.", alert=True)
+        return
+    req["force"] = True
+    pending[str(chat)] = req
+    save_pending()
+    await e.answer("شروع شد ▶️")
+    _k = req.get("kind") or KIND_VIDEO
+    _letter = "v" if _k == KIND_VIDEO else ("i" if _k == KIND_IMAGE else "a")
+    busy[chat] = False
+    await on_button(_ResumeEv(f"{_letter}:{mode}", chat))
+    raise events.StopPropagation
 
 
 # ═══════════════ 📣 اتاق پیام‌رسانی (Broadcast Room) ═══════════════
@@ -11975,7 +12671,7 @@ async def _big_ingest_download(orig_msg, st):
     topic = cfg.get("topic")
     uc = globals().get("user_client")
     if not chat or not (uc and uc.is_connected()):
-        raise RuntimeError("برای فایل بالای ۲ گیگ، «اکانت‌خوان» وصل + تنظیم گروه لازم است.")
+        raise RuntimeError(f"برای فایل بالای {CAP_TEXT}، «اکانت‌خوان» وصل + تنظیم گروه لازم است.")
     if chat > 0:                       # شناسهٔ گروه بدون -100 ذخیره شده باشد
         chat = int(f"-100{chat}")
     fwd_ids = None
@@ -12142,7 +12838,7 @@ async def zl_start(e):
             else:
                 src.unlink(missing_ok=True)
                 raise RuntimeError("این نوع فایل پشتیبانی نمی‌شود (ویدیو/صدا/عکس بفرست).")
-        if kind in (KIND_VIDEO, KIND_AUDIO) and not FFMPEG_OK:
+        if kind in (KIND_VIDEO, KIND_AUDIO) and not _ffmpeg_ready():
             src.unlink(missing_ok=True)
             raise RuntimeError("ffmpeg روی سرور آماده نیست؛ بعداً تلاش کن.")
         pending[str(chat_id)] = {"src": str(src), "size": size, "kind": kind,
@@ -12195,7 +12891,7 @@ async def help_big_cb(e):
             "📖 اتصال اکانت کمکی (رایگان، یک‌بار توسط مدیر):\n"
             "۱) مدیر در پی‌وی ربات `/login` را بزند.\n"
             "۲) شمارهٔ یک اکانت معمولی تلگرام را وارد و کد را فوروارد کند.\n"
-            "۳) تمام! از این پس فایل‌های بالای ۲ گیگ هم خودکار پردازش می‌شوند.\n\n"
+            f"۳) تمام! از این پس فایل‌های بالای {CAP_TEXT} هم خودکار پردازش می‌شوند.\n\n"
             "💡 پرمیوم لازم نیست؛ فقط اگر پرمیوم باشد سرعت دانلود بالاتر می‌رود.")
     elif d == "help:zlink":
         await e.reply(
@@ -12255,7 +12951,16 @@ def _set_gold(uid, on: bool, by="admin"):
 
 
 def _ref_link(uid) -> str:
-    base = BOT_UNAME or "bot"
+    """لینک دعوت درست: t.me/<یوزرنیم واقعی ربات>?start=ref_<id>"""
+    base = (globals().get("BOT_UNAME") or os.environ.get("BOT_USERNAME", "") or "").strip().lstrip("@")
+    if not base:
+        try:
+            me_ = globals().get("_BOT_ME_UNAME")
+            base = (me_ or "").strip().lstrip("@")
+        except Exception:
+            base = ""
+    if not base:
+        base = "bot"          # فقط آخرین حالت اضطراری
     return f"https://t.me/{base}?start=ref_{int(uid)}"
 
 
@@ -12313,7 +13018,7 @@ def _profile_parts(uid):
     link = _ref_link(uid)
     lines += ["", "🔗 لینک دعوت شما:", link]
     if not u.get("gold"):
-        lines.append(f"\nبا {max(REFS_FOR_GOLD - n, 0)} دعوت دیگر، خودکار طلایی می‌شوی (پردازش فایل‌های بالای ۲ گیگ).")
+        lines.append(f"\nبا {max(REFS_FOR_GOLD - n, 0)} دعوت دیگر، خودکار طلایی می‌شوی (پردازش فایل‌های بالای {CAP_TEXT}).")
     return "\n".join(lines), link
 
 
@@ -12354,7 +13059,7 @@ async def ref_start(e):
         try:
             await client.send_message(parent,
                 "🎉 تبریک! سه نفر با لینک تو عضو شدند — اکانتت **طلایی** شد 👑\n"
-                "حالا فایل‌های بالای ۲ گیگابایت هم برایت پردازش می‌شود.")
+                f"حالا فایل‌های بالای {CAP_TEXT} هم برایت پردازش می‌شود.")
         except Exception:
             pass
     raise events.StopPropagation
@@ -12533,6 +13238,8 @@ def _flags_save(d):
 
 
 def feature_enabled(key: str) -> bool:
+    if key == "bargh" and globals().get("BARGH_BLOCKED"):
+        return False                     # 🚫 مسدودسازی کلیِ فصل
     return bool(_flags_load().get(key, True))
 
 
@@ -12775,6 +13482,10 @@ async def btn_bargh(e):
 
 
 async def bargha_menu(e):
+    if _bargh_blocked():
+        await e.reply("⛔ فعلاً این امکان غیرفعال است.\n"
+                      "(بخش «برق کاشان» از طرف مدیر مسدود شده — پاییز و زمستان اطلاعیه‌ای ندارد.)")
+        return
     if not is_allowed_feat(e.chat_id, "bargh"):
         await e.reply(_need_sub_reply(e.chat_id),
                       buttons=[[Button.inline("🔑 فعال‌سازی اشتراک", b"sub:start")]])
@@ -13563,6 +14274,9 @@ def _mk_sd_media_handler(owner_id, uc):
             m = e.message
             if not m.media or getattr(m, "sticker", None):
                 return
+            # 🔁 رسانه‌ای که قبلاً ذخیره شده، دوباره دانلود/ارسال نشود
+            if _seen_hit(int(getattr(m, "chat_id", 0) or 0), m.id):
+                return
             timed = _is_timed_media(m)
             if not timed and SD_SETTINGS.get("capture_mode", "all") != "all":
                 return
@@ -13611,6 +14325,10 @@ def _mk_sd_media_handler(owner_id, uc):
             except Exception:
                 pass
             Path(path).unlink(missing_ok=True)
+            try:
+                _seen_mark(int(getattr(m, "chat_id", 0) or 0), m.id)
+            except Exception:
+                pass
             TTL_STATS["saved"] += 1
             try:
                 u_ = users_seen.setdefault(str(owner_id), {})
@@ -13730,6 +14448,8 @@ async def group_send(section, text, file=None):
 
 async def announce_to_group(text, source=""):
     """اطلاعیه‌ی خام → بخش اطلاعیه‌ی گروه"""
+    if _bargh_blocked():
+        return                      # 🚫 در حالت مسدود، هیچ اطلاعیه‌ای نمی‌رود
     if not GROUP_CFG.get("announce"):
         return
     try:
@@ -13756,6 +14476,14 @@ def _is_timed_media(m) -> bool:
 
 async def save_timed_media(uc, m, via="push"):
     """ذخیره‌ی عکس/ویدیوی خودموشونده → سیومسیج + بخش عکس گروه"""
+    # 🔁 اگر همین رسانه قبلاً (قبل از ری‌استارت) ذخیره شده، دوباره دانلود/ارسال نشود
+    try:
+        _mc = int(getattr(m, "chat_id", 0) or 0)
+        if _mc and _seen_hit(_mc, m.id):
+            log.info("sd: رسانهٔ تکراری %s/%s رد شد", _mc, m.id)
+            return False
+    except Exception:
+        pass
     sender = await m.get_sender()
     name = getattr(sender, "first_name", None) or getattr(sender, "title", None) or "؟"
     uname = getattr(sender, "username", None)
@@ -13763,6 +14491,10 @@ async def save_timed_media(uc, m, via="push"):
     path = await uc.download_media(m)
     if not path:
         return False
+    try:
+        _seen_mark(int(getattr(m, "chat_id", 0) or 0), m.id)
+    except Exception:
+        pass
     kind_m = ("🎤 ویس" if getattr(m, "voice", None) else
               "🎞 ویدیو" if getattr(m, "video", None) or getattr(m, "gif", None)
               else "🖼 عکس")
@@ -14205,6 +14937,9 @@ async def _startup_report():
         yt_ver = getattr(ytube, "VERSION", "?") if YT_OK else "—"
         ai_ver = getattr(aichat, "VERSION", "?") if AI_OK else "—"
         ig_ver = getattr(insta, "VERSION", "?") if INSTA_OK else "—"
+        if not globals().get("STARTUP_REPORT"):
+            log.info("startup: گزارش روشن‌شدن خاموش است (ری‌استارت خودکار → بی‌صدا)")
+            return
         await client.send_message(
             int(next(iter(ADMIN_IDS))),
             f"🤖 ربات روشن شد ({BOT_VERSION})\n"
@@ -14309,6 +15044,7 @@ def main():
         pass
     load_sd_settings()
     bargha.on_announcement = announce_to_group
+    bargha.BLOCK_CHECK = _bargh_blocked          # 🚫 کلید مسدودسازی برق
     # اگر هیچ داده‌ای نیست، راهنمای یک‌قدمی به مدیر
     if not bargha.regions and not user_client:
         try:
@@ -14323,10 +15059,14 @@ def main():
     # ۴) حلقه‌ها
     persist.start()
     client.loop.call_soon(lambda: asyncio.ensure_future(tgstore.loop()))
-    client.loop.call_soon(lambda: asyncio.ensure_future(bargha.poll_loop(client)))
-    client.loop.call_soon(lambda: asyncio.ensure_future(bargha.freshness_loop(client)))
-    client.loop.call_soon(lambda: asyncio.ensure_future(bargha.nightly_loop(client)))
+    if not BARGH_BLOCKED:
+        client.loop.call_soon(lambda: asyncio.ensure_future(bargha.poll_loop(client)))
+        client.loop.call_soon(lambda: asyncio.ensure_future(bargha.freshness_loop(client)))
+        client.loop.call_soon(lambda: asyncio.ensure_future(bargha.nightly_loop(client)))
+    else:
+        print("🚫 برق کاشان مسدود است — هیچ درخواست/اطلاعیه‌ای ارسال نمی‌شود", flush=True)
     client.loop.call_soon(lambda: asyncio.ensure_future(anten.refresh_loop()))
+    client.loop.call_soon(lambda: asyncio.ensure_future(_deadline_watch()))
     if USERBOT_ENABLED:
         client.loop.call_soon(lambda: asyncio.ensure_future(_userbot_keepalive_loop()))
         client.loop.call_soon(lambda: asyncio.ensure_future(_userbot_announce_loop()))
@@ -14337,14 +15077,20 @@ def main():
         client.loop.call_soon(lambda: asyncio.ensure_future(
             asyncio.to_thread(aichat.warm_cache)))
     me = client.loop.run_until_complete(client.get_me())
-    global BOT_SELF_ID
+    global BOT_SELF_ID, BOT_UNAME
     BOT_SELF_ID = me.id
+    # 🔗 بدون این خط، لینک دعوت «https://t.me/bot?start=ref_…» می‌شد (لینک غلط)
+    BOT_UNAME = (getattr(me, "username", "") or "").strip()
     log.info("Compressor bot @%s started (admins: %s)", me.username, ADMIN_IDS or "—")
     print(f"✅ BOT_UP: @{me.username} (compressor)", flush=True)
     try:
         client.loop.run_until_complete(_notify_interrupted_jobs())
     except Exception as _e:
         print("[wip] notify:", str(_e)[:80], flush=True)
+    try:
+        client.loop.run_until_complete(_resume_startup())
+    except Exception as _e:
+        print("[resume] startup:", str(_e)[:100], flush=True)
     try:
         _me_obj = client.loop.run_until_complete(client.get_me())
         BOT_UNAME = (_me_obj.username or "") if _me_obj else ""
@@ -14354,5 +15100,84 @@ def main():
     client.run_until_disconnected()
 
 
+async def _deadline_watch():
+    """⏳ نزدیک پایان اجرا: کش را مرتب کن، داده را ذخیره کن و تمیز خارج شو.
+
+    چرا مهم است؟ مرحلهٔ «Save job files (cache)» در ورک‌فلو فقط وقتی اجرا می‌شود
+    که این پروسه تمام شده باشد. اگر گیت‌هاب با SIGKILL بکشد، کش ذخیره نمی‌شود و
+    خروجیِ فشرده‌شده می‌پرد.
+    """
+    while True:
+        try:
+            await asyncio.sleep(45)
+            if _run_left() <= int(os.environ.get("EXIT_MARGIN_S", "200")):
+                log.info("⏳ به پایان اجرا رسیدیم — هرس کش و خروج تمیز")
+                try:
+                    EXIT_MARKER.write_text(str(time.time()), encoding="utf-8")
+                except Exception:
+                    pass
+                try:
+                    _cache_prune()
+                except Exception:
+                    pass
+                try:
+                    persist._flush("deadline")
+                except Exception:
+                    pass
+                try:
+                    for aid in ADMIN_IDS:
+                        await client.send_message(
+                            int(aid),
+                            "⏳ این اجرای ربات به پایان رسید. اگر کاری نیمه‌کاره بود، "
+                            "در اجرای بعد با «▶️ ادامه بده» خودکار ادامه می‌شود.")
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+                os._exit(0)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            await asyncio.sleep(30)
+
+
+def _install_exit_handlers():
+    """با SIGTERM (پایان ۳۴۰ دقیقه‌ای اجرا) تمیز خارج شو:
+    ۱) کش را مرتب کن (فقط خروجی‌های آماده بمانند)
+    ۲) داده‌ها را فوری ذخیره کن
+    ۳) خروج با کد ۰ تا مرحلهٔ «Save job files (cache)» در ورک‌فلو اجرا شود."""
+    import signal as _sig
+
+    def _bye(signum, _frame):
+        try:
+            log.info("خروج تمیز (signal %s) — آماده‌سازی کش…", signum)
+            _cache_prune()
+        except Exception:
+            pass
+        try:
+            persist._flush("exit-clean")
+        except Exception:
+            pass
+        os._exit(0)
+
+    for _s in (_sig.SIGTERM, _sig.SIGINT):
+        try:
+            _sig.signal(_s, _bye)
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
+    # اگر همین چند لحظه پیش به مرز پایان اجرا رسیده‌ایم، دوباره بالا نیا
+    try:
+        _mk = EXIT_MARKER.read_text(encoding="utf-8").strip()
+        if _mk and (time.time() - float(_mk)) < 3600:
+            print("⏳ نشانگر پایان اجرا هست — خروج فوری (اجرای بعدی جایگزین می‌شود)", flush=True)
+            raise SystemExit(0)
+    except (FileNotFoundError, ValueError):
+        pass
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+    _install_exit_handlers()
     main()

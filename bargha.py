@@ -686,6 +686,8 @@ def schedule_reminder(client, chat_id, reg, slot):
     async def _remind():
         await asyncio.sleep(delay)
         _scheduled.discard(key)
+        if blocked():                     # 🚫 در حالت مسدود هیچ یادآوری‌ای نمی‌رود
+            return
         try:
             await client.send_message(
                 chat_id,
@@ -694,7 +696,9 @@ def schedule_reminder(client, chat_id, reg, slot):
         except Exception:
             pass
 
-    asyncio.get_event_loop().create_task(_remind())
+    _t = asyncio.get_event_loop().create_task(_remind())
+    _TASKS.add(_t)
+    _t.add_done_callback(lambda x: _TASKS.discard(x))
 
 
 async def send_tomorrow_digest(client) -> int:
@@ -737,6 +741,37 @@ async def send_tomorrow_digest(client) -> int:
     return sent
 
 
+# ── 🚫 مسدودسازی کاملِ بخش برق (از پنل مدیر) ──────────────────────
+# پاییز و زمستان قطعی برق نداریم؛ با این کلید هیچ درخواستی به کانال‌ها
+# نمی‌رود، هیچ یادآوری/اطلاعیه‌ای ارسال نمی‌شود و هیچ پیامی به کاربر نمی‌رسد.
+BLOCK_CHECK = None          # bot.py وصلش می‌کند: lambda: True/False
+_TASKS = set()              # تسک‌های یادآوری، برای لغو دسته‌جمعی
+
+
+def blocked() -> bool:
+    try:
+        return bool(BLOCK_CHECK and BLOCK_CHECK())
+    except Exception:
+        return False
+
+
+def cancel_all() -> int:
+    """لغو همهٔ یادآوری‌های زمان‌بندی‌شده."""
+    n = 0
+    for t in list(_TASKS):
+        try:
+            t.cancel()
+            n += 1
+        except Exception:
+            pass
+    _TASKS.clear()
+    try:
+        _scheduled.clear()
+    except Exception:
+        pass
+    return n
+
+
 async def nightly_loop(client):
     """هر شب ساعت ۰۰:۰۰ به وقت ایران — گزارش فردا برای همه"""
     last_day = None
@@ -745,6 +780,8 @@ async def nightly_loop(client):
             now = iran_now()
             next_mid = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
             await asyncio.sleep(min((next_mid - now).total_seconds(), 6 * 3600))
+            if blocked():
+                continue
             if iran_now().hour != 0:
                 continue   # هنوز نیمه‌شب نشده؛ دوباره حساب کن
             today = iran_now().date()
@@ -781,6 +818,8 @@ async def poll_loop(client):
     reschedule_all(client)
     while True:
         await asyncio.sleep(POLL_MINUTES * 60)
+        if blocked():
+            continue
         try:
             posts = await asyncio.to_thread(fetch_posts)
             if not posts:
@@ -850,6 +889,8 @@ async def freshness_loop(client):
             if nxt is None:
                 nxt = (today + timedelta(days=1)).replace(hour=10)
             await asyncio.sleep(min((nxt - now).total_seconds(), 6 * 3600))
+            if blocked():
+                continue
             # رسیدیم به زمان چک
             if not _today_slots():
                 msg = ("📋 گزارش تازگی اطلاعیه‌ها\n" + freshness_text() +
