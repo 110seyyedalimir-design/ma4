@@ -13103,16 +13103,20 @@ INVITE_LINES = (
 
 
 def _invite_text(uid) -> str:
-    """📨 متن آمادهٔ دعوت — نسخهٔ غنی (HTML).
+    """📨 متن آمادهٔ دعوت — متنِ عادی (بدون شماره و بُلد).
 
-    هر جا «آچار فرانسه» نوشته شده، خودش لینک است: مخاطب آدرس `?start=ref_…`
-    را نمی‌بیند، ولی لمس هر کدام همان لینک زیرمجموعه‌ای را باز می‌کند.
-    (نیاز به parse_mode="html")
+    خط اول و خط آخر لینکِ زیرمجموعه‌ای‌اند، پشت کلمهٔ «آچار فرانسه» پنهان:
+    مخاطب آدرس `?start=ref_…` را نمی‌بیند، ولی لمس هر کدام همان لینک را
+    باز می‌کند و زیرمجموعه ثبت می‌شود. (نیاز به parse_mode="html")
     """
     link = _ref_link(uid)
-    head, mid, tail = INVITE_LINES[0], INVITE_LINES[1:-1], INVITE_LINES[-1]
-    return "\n".join([f"🤖 <b>{head}</b>", *mid, tail,
-                       f'<a href="{link}">🤖 آچار فرانسه</a>'])
+    a = f'<a href="{link}">آچار فرانسه</a>'
+    return "\n".join([
+        f"🤖 ربات {a} — رباتِ همه‌کارهٔ رایگان با امکانات زیره:",
+        *INVITE_LINES[1:-1],
+        INVITE_LINES[-1],
+        f"👉 {a}",
+    ])
 
 
 def _invite_plain(uid) -> str:
@@ -13188,14 +13192,8 @@ def _profile_parts(uid):
             lines.append(f"   … و {n - shown} نفر دیگر")
     link = _ref_link(uid)
     lines += ["",
-              "📋 <b>این متن را کپی کن</b> و برای هر کسی خواستی بفرست:",
-              f"<pre>{_invite_plain(uid)}</pre>",
-              "",
               "🔗 لینک دعوت شما:",
-              f"<code>{link}</code>",
-              "",
-              f'📤 <a href="{_invite_share_url(uid)}">اشتراک‌گذاری مستقیم</a>'
-              " — مخاطب را خودت انتخاب می‌کنی، متن آماده هم خودکار می‌رود"]
+              f"<code>{link}</code>"]
     if not u.get("gold"):
         lines.append(f"\nبا {max(REFS_FOR_GOLD - n, 0)} دعوت دیگر، خودکار طلایی می‌شوی (پردازش فایل‌های بالای {CAP_TEXT}).")
     return "\n".join(lines), link
@@ -13203,7 +13201,7 @@ def _profile_parts(uid):
 
 async def _send_profile(target, uid):
     txt, link = _profile_parts(uid)
-    kb = [[Button.inline("📨 متن آمادهٔ دعوت", b"ref:share")]]
+    kb = [[Button.inline("📤 اشتراک‌گذاری مستقیم", b"ref:share")]]
     if hasattr(target, "reply"):
         await target.reply(txt, buttons=kb, link_preview=False, parse_mode="html")
     else:
@@ -13222,10 +13220,8 @@ async def ref_share_cb(e):
         e.chat_id, _invite_text(e.sender_id), parse_mode="html", link_preview=False)
     await client.send_message(
         e.chat_id,
-        "☝️ دو راه: <b>فوروارد</b> همین پیام، یا <b>کپی</b> متن زیر 👇\n\n"
-        f"<pre>{_invite_plain(e.sender_id)}</pre>\n"
-        "هر کس روی «آچار فرانسه» بزند، ربات باز می‌شود و زیرمجموعهٔ تو ثبت می‌شود.",
-        parse_mode="html", link_preview=False)
+        "☝️ روی همین پیام نگه دار و «Forward» بزن، بعد مخاطب را انتخاب کن.\n"
+        "هر کس روی «آچار فرانسه» بزند، ربات برایش باز می‌شود و زیرمجموعهٔ تو ثبت می‌شود.")
 
 
 @client.on(events.NewMessage(pattern=r"^/start ref_(\d+)$"))
